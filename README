@@ -1,0 +1,25 @@
+Boo!
+
+This is the source code for the HaunTix ticketing system.
+It's a point-of-sale and on-line (web) ticketing system,
+plus an entry control system to scan the tickets at the
+entry to the attraction.
+
+I wrote it for use at my haunted attraction, the Haunted Mines,
+after trying several commercial alternatives and not liking them.
+I'm very happy with HaunTix -- a sentiment shared by our ticketing
+agents for nearly a decade.
+
+So, I'm putting it into the community as open source, but in it's present
+state it is not ready for general use.  I hope to get it there some
+day.  The main code works fine, but the packinging and setup
+require lots of manual intervention and a good knowledge of Linux and SQL.
+
+This system is not limited to haunted attractions.  It's a good general-purpose
+point-of-sale system.  
+
+Please note that at this time, this is not supported at all.
+Thus... good luck!
+
+-- Uncle Spook (aka Steve)
+

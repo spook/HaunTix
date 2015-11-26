@@ -1,0 +1,246 @@
+#!/usr/bin/perl -w
+#
+# Free ticket generator - creates sales transactions for groups of tickets
+#
+
+### TODO:
+#  Add -g --gift-certificate to generate a gift cert PDF file with the pcode on it
+#  Add -o --output-file to specify the gift cert filename
+#  Add -m --mailto to automatically email the pickup code as text, and
+#        the gift cert PDF if it was generated
+
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long qw(:config no_ignore_case);
+use Pod::Usage;
+use Term::Emit qw/:all/;
+use htx;
+use htx::show;
+use htx::ticket;
+use htx::transaction;
+
+#<<<
+my $opts = {};
+GetOptions($opts,     
+           "help|h",
+           "config-file|c=s", 
+           "quantity|n=i",
+           "show|s=i", 
+           "instructions|i", 
+           "ticket-note|t=s", 
+           "transaction-note|T=s",
+           "webdb|w",  
+           "verbose|v+"
+          ) or pod2usage(2);
+#>>>
+pod2usage(1) if $opts->{help};
+Term::Emit::setopts(-maxdepth => $opts->{verbose} || 0,
+                    -showseverity => $Term::Emit::SEVLEV{'WARN'});
+emit "Checking options";
+my $shonum = $opts->{show} || 0;
+exit emit_fail {-reason => "*** --show must specify the show number\n"}
+    if !$shonum || ($shonum !~ m/^\d+$/);
+my $ntix = $opts->{quantity} || 0;
+exit emit_fail {-reason => "*** Must specify a --quantity\n"}
+    if !$ntix || ($ntix !~ m/^\d+$/);
+my $pool = $opts->{pool} || ($opts->{webdb} ? $TIX_POOL_WEB : $TIX_POOL_BOOTH);
+exit emit_fail {-reason => "--pool must be '$TIX_POOL_BOOTH' or '$TIX_POOL_WEB'\n"}
+    if ($pool ne $TIX_POOL_BOOTH) && ($pool ne $TIX_POOL_WEB);
+emit_ok;
+
+# Good random seed
+srand(time ^ $$ ^ unpack "%L*", `ps axww | gzip -f`);
+
+# Globals & config
+emit "Loading configuration";
+my $htx = {opts => $opts};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+my $cfg = $htx->{cfg};
+emit_ok;
+
+# Database setup
+init_db($htx);
+my $db = $htx->{db};
+
+# Find the show
+emit "Finding show";
+my @shows = htx::show::all_shows($htx);
+my $show  = undef;
+foreach my $s (@shows) {
+    if ($s->{shoId} == $shonum) {
+        $show = $s;
+        last;
+    }
+}
+exit emit_fail {-reason => "No such show number $shonum"} if !$show;
+emit_ok;
+
+# Build transaction
+emit "Creating transaction";
+my $trn = htx::transaction->new(
+    -htx           => $htx,
+    -trnUser       => $ENV{USER},
+    -trmMOD        => "auto",
+    -trnRemoteAddr => $ENV{REMOTE_ADDR} || "--n/a--",
+    -trnEmail      => "--n/a--",
+    -trnStation => $opts->{webdb} ? uc($cfg->{web}->{station_id}) : uc($cfg->{pos}->{station_id}),
+    -trnNote => $opts->{'transaction-note'} || "Comp by $ENV{USER}",
+);
+exit emit_error {-reason => $trn->error} if $db->error;
+emit_ok;
+
+# Add items (tickets) to the sale; this reserves the tickets
+#   Verify the requested shows as we do this.
+emit "Reserving tickets";
+my $item = {
+    trnId        => $trn->{trnId},
+    show         => $show,
+    itmType      => "prd",              ### TODO: Use constant
+    itmName      => $show->{shoName},
+    itmCost      => $show->{shoCost},
+    itmPaid      => 0,
+    itmIsTaxable => 0,
+    itmIsTicket  => 1,
+    tixPool      => $pool,
+};
+$trn->add_item($item, $ntix);
+if ($trn->error) {
+    my $t1err = $trn->error;
+    $trn->cancel;
+    my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+    exit emit_error {-reason => "Unable to add show $shonum to the transaction: $t1err, $t0err"};
+}
+
+# Add ticket note
+if ($opts->{'ticket-note'}) {
+    foreach my $tix ($trn->tickets()) {
+        $tix->{tixNote} = $opts->{'ticket-note'};
+        $tix->save;
+    }
+}
+
+emit_ok;
+
+# Automatic discounts
+emit "Applying full discount";
+$item = {
+    trnId        => $trn->{trnId},
+    show         => undef,
+    itmType      => "dsc",              ### TODO: Use constant
+    itmName      => '100% Discount',    ### TODO: get from d/b
+    itmCost      => -10000,
+    itmMethod    => "Percent",
+    itmIsTaxable => 0,
+    itmIsTicket  => 0,
+    tixPool      => undef,
+};
+$trn->add_item($item, $ntix);
+if ($trn->error) {
+    my $t1err = $trn->error;
+    $trn->cancel;
+    my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+    exit emit_error {-reason => "Unable to apply discount to the transaction: $t1err, $t0err"};
+}
+
+$trn->fullcomp(1);
+emit_ok;
+
+emit "Completing transaction";
+$trn->retally();
+$trn->phase_check();
+$trn->complete();
+if ($trn->error) {
+    my $t1err = $trn->error;
+    $trn->cancel;
+    my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+    exit emit_error {-reason => "Unable to complete the transaction: $t1err, $t0err"};
+}
+emit_ok;
+
+if ($opts->{instructions}) {
+    print qq{
+To view and print your tickets:
+* Go to the $cfg->{haunt}->{name} website ( $cfg->{haunt}->{website} ).
+* Click the "Buy Tickets Now" button.
+* Then click the "Enter Pickup Code" button.
+* Enter your Pickup Code and email address to receive your tickets. 
+
+};
+}
+my $when = "valid thru " . substr($show->{shoSellUntil}, 0, 10);
+if ($show->{shoIsDaily} || $show->{shoIsTimed}) {
+    $when = "to the " . substr($show->{shoTime}, 0, 10) . " show";
+}
+my $class = $show->{shoClass} || q{};
+my $s = $ntix == 1? q{} : q{s};
+print "  Pickup Code " . $trn->fmtpickup() . "   for $ntix $class ticket$s $when\n";
+if ($opts->{instructions}) {
+    print qq{
+Thanx for visiting the $cfg->{haunt}->{name} - we look forward to scaring you! 
+};
+}
+if ($opts->{verbose}) {
+    foreach my $tix (@{$trn->{tickets}}) {
+        print "    Ticket " . $tix->tixno() . "\n";
+    }
+}
+
+# Send email
+# ... later, or maybe never
+
+exit 0;
+
+# Connect to the database
+sub init_db {
+    my $htx   = shift;
+    my $opts  = $htx->{opts};
+    my $dbloc = $opts->{webdb} ? $htx->{cfg}->{dbweb} : $htx->{cfg}->{db};
+    emit "Connecting to database at $dbloc->{host}" if $opts->{verbose};
+    my $db = new htx::db;
+    $htx->{db} = $db;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->connect($dbloc);
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->setup;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    return emit_ok if $opts->{verbose};
+}
+
+__END__
+
+=head1 NAME
+
+htx-mkcomp - HaunTix Free Tickets Generator
+
+=head1 SYNOPSIS
+
+ htx-mkcomp [options]
+
+ Options:
+  -h    --help              Usage summary
+  -c    --config-file       Alternate config file
+  -s    --show              Show number         - required
+  -n    --quantity          Number of tickets   - required
+  -i    --instructions      Print instructions with the pickup code
+  -t    --ticket-note       Short note to put on each ticket
+  -T    --transaction-note  Brief comment for the transaction record
+  -w    --webdb             Use web database
+  -v    --verbose           Verbose output
+
+=head1 DESCRIPTION
+
+Creates transactions with sales of tickets that are fully comp'd (free),
+and emits the pickup codes for the transaction.  This utility is used
+wheh you need to generating pickup codes to give out for promotionals,
+awards, etc.
+
+Example:
+  htx-mkcomp -s 200 -n 4 \
+        -t "Welcome Military Winner!" -T "KAFA contest"
+
+=cut

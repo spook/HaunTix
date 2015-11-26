@@ -1,0 +1,18 @@
+run tasksel, install LAMP Server
+
+Debian Perl packages:
+  libconfig-std-perl
+  libclass-std-perl
+  libdate-manip-perl
+  perl-tk
+
+
+Perl Packages from CPAN:
+  Term::Emit
+    --> Scope::Upper
+  Tk::NumKeypad
+  Tk::FullKeypad
+  Tk::DoCommand
+    --> Proc::Killfam
+  Tk::FmtEntry
+

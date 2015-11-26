@@ -1,0 +1,187 @@
+#!/usr/bin/perl -w
+use strict;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long;
+use htx;
+use htx::db;
+use Pod::Usage;
+use Term::Emit qw/:all/;
+
+my $opts = {};
+GetOptions($opts, "config-file|c=s", "help|h", "verbose|v") or pod2usage(2);
+pod2usage(1) if $opts->{help};
+
+emit "Loading config";
+my $htx = {};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+emit_done;
+
+connect_db($htx);
+do_report($htx);
+
+exit 0;
+
+# Database setup
+sub connect_db {
+    my $htx = shift;
+    my $cfg = $htx->{cfg};
+    emit "Connecting to database";
+
+    my $db = $htx->{db} = htx::db->new;
+
+    $db->connect($cfg->{db});
+    exit emit_fail {-reason => "Unable to connect to database: " . $db->error}
+        if $db->error;
+    $db->setup;
+    exit emit_fail {-reason => "Unable to setup database: " . $db->error}
+        if $db->error;
+
+    emit_done;
+}
+
+sub do_report {
+    my $htx = shift;
+    my $db  = $htx->{db};
+
+    my $y = 2011;
+    my $m = 10;
+    my $h = 3;
+    my $n = 0;
+    my $s = 0;
+
+    my $btot = 0;
+    my $wtot = 0;
+
+    print "   Date      Booth Cash    B Check   B Credit    B Total     Web Cash    W Check   W Credit  Web Total     Daily Take\n";
+    print "----------   ---------- ---------- ---------- ----------   ---------- ---------- ---------- ----------   -------------\n";
+
+
+    foreach my $d (1 .. 31) {
+
+        my $from = sprintf('%4.4d-%2.2d-%2.2d %2.2d:%2.2d:%2.2d', $y, $m, $d,     $h, $n, $s);
+        my $to   = sprintf('%4.4d-%2.2d-%2.2d %2.2d:%2.2d:%2.2d', $y, $m, $d + 1, $h, $n, $s);
+
+        # Booth query
+        ### TODO: subtract chgType=Refund amounts
+        my $sql = qq{SELECT  
+               SUM(z.trnCashTotal)   AS cashTotal,
+               SUM(z.trnCheckAmount) AS checkTotal,
+               SUM(z.chgTotal)       AS chargeTotal,
+               SUM(z.trnTotal)       AS trnTotal
+         FROM (SELECT t.trnId,
+                      t.trnTimestamp,
+                      t.trnStation,
+                      x.trnTotal - x.trnCheckAmount - IFNULL(SUM(g.chgAmount),0) AS trnCashTotal,
+                      t.trnCheckAmount,
+                      IFNULL(SUM(g.chgAmount),0) AS chgTotal,
+                      x.trnTotal
+                 FROM (SELECT t.trnId,
+                              t.trnCheckAmount,
+                              SUM(s.salPaid*s.salQuantity)+t.trnServiceCharge+t.trnTaxAmount
+                                 AS trnTotal
+                         FROM sales s, transactions t 
+                        WHERE s.trnId = t.trnId 
+                          AND t.trnPhase = 'z'
+                          AND t.trnStation != 'W'
+                          AND t.trnTimestamp >  '$from'
+                          AND t.trnTimestamp <= '$to'
+                        GROUP BY t.trnId) AS x,
+                      transactions t
+                LEFT JOIN charges g
+                   ON t.trnId = g.trnId
+                  AND g.chgType = 'Charge'
+                WHERE t.trnId = x.trnId
+                GROUP BY t.trnId) AS z;
+        };
+        my $recs = $db->select($sql);
+        exit emit_fail {-reason => "Failed on report select: " . $db->error()}
+            if $db->error();
+        exit emit_fail {-reason => "Expected one result from select"}
+            if @$recs != 1;
+        my $brec = $recs->[0] || {};
+        $btot += $brec->{trnTotal} || 0;
+
+        # Web query
+        ### TODO: subtract chgType=Refund amounts
+        $sql = qq{SELECT  
+               SUM(z.trnCashTotal)   AS cashTotal,
+               SUM(z.trnCheckAmount) AS checkTotal,
+               SUM(z.chgTotal)       AS chargeTotal,
+               SUM(z.trnTotal)       AS trnTotal
+         FROM (SELECT t.trnId,
+                      t.trnTimestamp,
+                      t.trnStation,
+                      x.trnTotal - x.trnCheckAmount - IFNULL(SUM(g.chgAmount),0) AS trnCashTotal,
+                      t.trnCheckAmount,
+                      IFNULL(SUM(g.chgAmount),0) AS chgTotal,
+                      x.trnTotal
+                 FROM (SELECT t.trnId,
+                              t.trnCheckAmount,
+                              SUM(s.salPaid*s.salQuantity)+t.trnServiceCharge+t.trnTaxAmount
+                                 AS trnTotal
+                         FROM sales s, transactions t 
+                        WHERE s.trnId = t.trnId 
+                          AND t.trnPhase = 'z'
+                          AND t.trnStation = 'W'
+                          AND t.trnTimestamp >  '$from'
+                          AND t.trnTimestamp <= '$to'
+                        GROUP BY t.trnId) AS x,
+                      transactions t
+                LEFT JOIN charges g
+                   ON t.trnId = g.trnId 
+                  AND g.chgType = 'Charge'
+                WHERE t.trnId = x.trnId
+                GROUP BY t.trnId) AS z;
+        };
+        $recs = $db->select($sql);
+        exit emit_fail {-reason => "Failed on report select: " . $db->error()}
+            if $db->error();
+        exit emit_fail {-reason => "Expected one result from select"}
+            if @$recs != 1;
+        my $wrec = $recs->[0] || {};
+        $wtot += $wrec->{trnTotal} || 0;
+
+        printf "%4.4d-%2.2d-%2.2d   %10s %10s %10s %10s   %10s %10s %10s %10s   %13s\n", $y, $m, $d,
+            dollar($brec->{cashTotal}   || 0),
+            dollar($brec->{checkTotal}  || 0),
+            dollar($brec->{chargeTotal} || 0),
+            dollar($brec->{trnTotal}    || 0),
+
+            dollar($wrec->{cashTotal}   || 0),
+            dollar($wrec->{checkTotal}  || 0),
+            dollar($wrec->{chargeTotal} || 0),
+            dollar($wrec->{trnTotal}    || 0),
+
+            dollar(($brec->{trnTotal} || 0) + ($wrec->{trnTotal} || 0));
+    }
+    print "----------   ---------- ---------- ---------- ----------   ---------- ---------- ---------- ----------   -------------\n";
+    printf "             %10s %10s %10s%11s   %10s %10s %10s%11s   %13s\n", 
+            '','','',dollar($btot),
+            '','','',dollar($wtot),
+            dollar($btot+$wtot);
+
+}
+
+__END__
+
+=head1 NAME
+
+htx-report-take - HaunTix report of daily "take"
+
+=head1 SYNOPSIS
+
+ htx-report-takes [options]
+
+ Options:
+  -h    --help          Usage summary
+  -c    --config-file   Alternate config file
+  -v    --verbose       Verbose output
+
+=head1 DESCRIPTION
+
+Produces a simple report that shows the daily cash, check, and credit/debit card
+income according to the transaction (register) amounts.
+
+=cut
+

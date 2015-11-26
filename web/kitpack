@@ -1,0 +1,37 @@
+#!/bin/bash
+
+echo Hauntix Web kit packager
+
+echo '  Preparing build directories'
+rm -fr kit
+mkdir kit
+mkdir kit/bin
+mkdir kit/etc
+mkdir kit/etc/htx
+mkdir kit/pm
+mkdir kit/pm/htx
+mkdir kit/html
+mkdir kit/html/cgi
+
+echo '  Copying files into web structure'
+cp ../pkg/etc/htx/hauntix.conf      kit/etc/htx
+cp ../pkg/usr/bin/htx-*             kit/bin
+cp ../pkg/usr/share/htx/*.sql       kit/etc/htx
+cp ../pkg/usr/share/perl5/*.pm      kit/pm
+cp ../pkg/usr/share/perl5/htx/*.pm  kit/pm/htx
+
+cp html/*           kit/html
+cp cgi/*.cgi        kit/html/cgi
+cp -r pm/*          kit/pm
+
+echo '  Mode setting'
+chmod 704 kit/html/*
+chmod 705 kit/html/cgi/*
+chmod 705 kit/bin/*
+chmod 704 kit/etc/htx/*
+chmod -R 704 kit/pm
+
+echo '  Building tarball'
+tar -C kit -czf hauntix-web.tgz .
+
+echo All done.

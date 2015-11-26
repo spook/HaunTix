@@ -1,0 +1,299 @@
+#!/usr/bin/perl -w
+#
+# Reporting utility
+#
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long;
+use Pod::Usage;
+use POSIX;
+use htx;
+use htx::pos_db;
+
+my $opts = {};
+GetOptions ($opts, "help|h",
+                   "config-file|c=s",
+                   "date|d=s",
+                   "to|t=s",
+                   "verbose|v") or pod2usage(2);
+pod2usage(1) if $opts->{help};
+
+# Globals & config
+my $htx = {};
+read_config $opts->{'config-file'}||$CONFIG_FILE => $htx->{cfg};
+
+# Database setup
+connect_db($htx);
+my $db = $htx->{db};
+print "Connected to database\n" if $opts->{verbose};
+
+# Compute date range
+my $today = strftime("%Y-%m-%d", localtime());
+my $date = $opts->{date} || $today;
+die "*** Bad date '$date', must be YYYY-MM-DD\n"
+    if $date !~ m/\d{4}-\d\d-\d\d/;
+my $to = $opts->{to} || $date;
+die "*** Bad to-date '$to', must be YYYY-MM-DD\n"
+    if $to !~ m/\d{4}-\d\d-\d\d/;
+my $t_from = qq{"$date 03:00:00"};
+my $t_to   = qq{timestamp("$to 03:00:00","24:00:00")};
+my $hdr = "HaunTix Summary Report for $date";
+print "\n$hdr\n";
+print '=' x length($hdr);
+print "\n";
+
+# Scan counts
+my $sql;
+my %scans = ();
+$scans{"Allowed/Entry OK"} = select_count($db,
+      "SELECT count(*) AS cnt FROM scans"
+    . " WHERE scnTimestamp >= $t_from"
+    . "   AND scnTimestamp < $t_to"
+    . "   AND scnResult IN ('Allowed','ForceAllow')"
+    . "   AND scnStatus != 'side-in'"
+    );
+$scans{"Allowed/Trolls"} = select_count($db,
+      "SELECT count(*) AS cnt FROM scans"
+    . " WHERE scnTimestamp >= $t_from"
+    . "   AND scnTimestamp < $t_to"
+    . "   AND scnResult IN ('Allowed','ForceAllow')"
+    . "   AND scnStatus = 'side-in'"
+    );
+foreach my $status (('No Such Ticket',
+                     'Invalid Ticket',
+                     'Ticket Not Yet Sold',
+                     'Ticket is VOID',
+                     'Ticket Already Used')) {
+    $scans{"Denied/$status"} = select_count($db,
+          "SELECT count(*) AS cnt FROM scans"
+        . " WHERE scnTimestamp >= $t_from"
+        . "   AND scnTimestamp < $t_to"
+        . "   AND scnResult IN ('Denied','ForceDeny')"
+        . "   AND scnStatus = '$status'"
+        );
+}
+print "\nScan Counts\n";
+foreach my $result (sort keys %scans) {
+    printf '  %-30s  %5d'."\n", $result, $scans{$result};
+}
+
+# Get comp ticket transaction list
+my $comprecs = $db->select(
+              "SELECT n.trnId FROM transactions n, sales s"
+            . " WHERE s.trnId   = n.trnId"
+            . "   AND s.salType = 'dsc'"
+            . "   AND s.salName = '100% Discount'"
+            . "   AND n.trnTimestamp >= $t_from"
+            . "   AND n.trnTimestamp <  $t_to"
+            );
+my @comps = map {$_->{trnId}} @$comprecs;
+push @comps, 0 if !@comps;
+
+# Ticket sales, without comps
+print "\nTicket Sales           Unused   Used   Void   Swap    Total\n";
+my $shows = $db->select("SELECT shoId, shoName FROM shows");
+die "*** Database error: " . $db->error() . "\n" if $db->error();
+my %gamt = ();
+my $gtotal = 0;
+foreach my $showrec (@$shows) {
+    my $total = 0;
+    my %amt = ();
+    foreach my $tixState (qw/Sold Used Void Swap/) {
+        $amt{$tixState} = select_count($db,
+              "SELECT count(*) AS cnt"
+            . "  FROM transactions n, sales s, tickets x"
+            . " WHERE x.salId = s.salId"
+            . "   AND s.trnId = n.trnId"
+            . "   AND x.shoId = " . $db->quote($showrec->{shoId})
+            . "   AND x.tixState = " . $db->quote($tixState)
+            . "   AND n.trnTimestamp >= $t_from"
+            . "   AND n.trnTimestamp <  $t_to"
+            . "   AND n.trnId NOT IN (" . join(q{,}, @comps) . ")"
+            );
+        $total += $amt{$tixState};
+        $gtotal += $amt{$tixState};
+        $gamt{$tixState} += $amt{$tixState};
+    }
+    printf '  %-20s  %5d  %5d  %5d  %5d  %7d'."\n", 
+            $showrec->{shoName}, 
+            $amt{'Sold'}, $amt{'Used'}, $amt{'Void'}, $amt{'Swap'}, $total;
+}
+
+# Ticket comps
+print "Ticket Comps\n";
+foreach my $showrec (@$shows) {
+    my $total = 0;
+    my %amt = ();
+    foreach my $tixState (qw/Sold Used Void Swap/) {
+        $amt{$tixState} = select_count($db,
+              "SELECT count(*) AS cnt"
+            . "  FROM transactions n, sales s, tickets x"
+            . " WHERE x.salId = s.salId"
+            . "   AND s.trnId = n.trnId"
+            . "   AND x.shoId = " . $db->quote($showrec->{shoId})
+            . "   AND x.tixState = " . $db->quote($tixState)
+            . "   AND n.trnTimestamp >= $t_from"
+            . "   AND n.trnTimestamp <  $t_to"
+            . "   AND n.trnId IN (" . join(q{,}, @comps) . ")"
+            );
+        $total += $amt{$tixState};
+        $gtotal += $amt{$tixState};
+        $gamt{$tixState} += $amt{$tixState};
+    }
+    printf '  %-20s  %5d  %5d  %5d  %5d  %7d'."\n", 
+            $showrec->{shoName}, 
+            $amt{'Sold'}, $amt{'Used'}, $amt{'Void'}, $amt{'Swap'}, $total;
+}
+print  "  --------------------  -----  -----  -----  -----  ------\n";
+printf '  %-20s  %5d  %5d  %5d  %5d  %7d'."\n", 
+            q{}, 
+            $gamt{'Sold'}, $gamt{'Used'}, $gamt{'Void'}, $gamt{'Swap'}, $gtotal;
+
+
+# Show entry queue depths and wait times, by show
+print "\nWait times by show\n";
+print "      Show Name         AvgWait  xMedian   StdDev\n";
+print "  --------------------  -------  -------  -------\n";
+my $showdelays = {};
+foreach my $showrec (@$shows) {
+    # Get all tickets bought and used(scanned) on the same day, and
+    #   the time difference between purchase and scanning.
+    # Because the ticket agents tend to pre-print cash tickets so they
+    #   can do faster transactions, it skews the timestamps on those.
+    #   Thus credit card transactions are more accurate,
+    #   I find those by looking for $0 cash amounts.
+    my $sql =
+          "select x.tixId, k.scnTimestamp, n.trnTimestamp, n.trnCashAmount,"
+        . "  TIME_TO_SEC(TIMEDIFF(k.scnTimestamp, n.trnTimestamp)) AS wait"
+        . "  FROM scans k, transactions n, sales s, tickets x"
+        . " WHERE x.salId = s.salId"
+        . "   AND s.trnId = n.trnId"
+        . "   AND x.shoId = " . $db->quote($showrec->{shoId})
+        . "   AND x.tixstate IN ('Sold','Used')"
+        . "   AND n.trnTimestamp >= $t_from"
+        . "   AND n.trnTimestamp < $t_to"
+        . "   AND k.scnTimestamp >= $t_from"
+        . "   AND k.scnTimestamp < $t_to"
+        . "   AND k.scnResult IN ('Allowed','ForceAllow')"
+        . "   AND k.scnNumber != 0"
+        . "   AND LEFT(k.scnNumber, LENGTH(k.scnNumber)-4) = x.tixId"
+        . " ORDER BY k.scnTimestamp"
+        ;
+    print "SQL = $sql\n" if $opts->{verbose};
+    my $delays = $db->select($sql);
+    die "*** Database error: " . $db->error() . "\n" if $db->error();
+    $showdelays->{$showrec->{shoName}} = $delays;
+
+    # Calculate mean (also capture wait times list)
+    my $n = 0;
+    my $mean = 0;
+    my @waits = ();
+    foreach my $drec (@$delays) {
+        $n++;
+        $mean += $drec->{wait};
+        push @waits, $drec->{wait};
+    }
+    $mean = int($mean/$n) if $n;
+
+    # Standard deviation
+    my $stdev = 0;
+    if ($n > 1) {
+        foreach my $drec (@$delays) {
+            $stdev += ($drec->{wait} - $mean)**2;
+        }
+        $stdev = int(sqrt($stdev/($n-1)));
+    }
+
+    ### TODO:  compute a median BY HALF_HOUR, excluding 2*sigma outliers
+    ### TODO:  Or, graph this with ascii art?
+    my $median = $n? $waits[0] : 0;
+    my $m = 0;
+    my $k = 1.5;
+    my @okwaits = ();
+    foreach my $wt (sort @waits) {
+        next if abs($wt - $mean) > ($k*$stdev);     # Outlier
+        push @okwaits, $wt;
+        $m++;
+    }
+    if ($m > 1) {
+        $median = $m%2 ? $okwaits[int($m/2)-1] 
+                       : int($okwaits[int($m/2)-1] + $okwaits[int($m/2)])/2;
+    }
+    printf '  %-20s  %7s  %7s  %7s (%2d outliers)'."\n", 
+            $showrec->{shoName}, hms($mean), hms($median), hms($stdev), $n-$m;
+}
+
+# Give most-recent entry stats by show
+my $CC_WAIT_QTY = 6;
+print "\nMost Recent Wait Times\n";
+print   "----------------------\n";
+print "\tIndicates how long it's been from ticket purchase to ticket use,\n";
+print "\tfor the last $CC_WAIT_QTY people scanned-in, when they purchased the tickets\n";
+print "\tthe tickets with a credit/debit card.\n\n";
+foreach my $showrec (@$shows) {
+    printf '  %-20s  ', $showrec->{shoName};
+    my $delays = $showdelays->{$showrec->{shoName}};
+    if (!$delays) {
+        print "  ---\n";
+        next;
+    }
+
+    # Get last X credit-card-purchased delays
+    my $cc_count = 0;
+    foreach my $delay (reverse @$delays) {
+        next if $delay->{trnCashAmount};    # skip cash sales
+        ++$cc_count;
+        printf '%7s  ', hms($delay->{wait});
+        last if $cc_count >= $CC_WAIT_QTY;
+    }
+    print "  ---" if !$cc_count;
+    print "\n";
+}
+
+exit 0;
+
+# Seconds to HH:MM:SS
+sub hms {
+    my $secs = shift;
+    my $hh = int($secs/3600);
+    my $mm = int(($secs-3600*$hh)/60);
+    my $ss = $secs-3600*$hh-$mm*60;
+    return sprintf('%d:%2.2d:%2.2d', $hh, $mm, $ss);
+}
+
+# Do a select that returns just a single count as "cnt"
+sub select_count {
+    my ($db, $sql) = @_;
+    print "SQL = $sql\n" if $opts->{verbose};
+    my $rows = $db->select($sql);
+    die "*** Database error: " . $db->error() . "\n" if $db->error();
+    die "*** Unexpected result, not one row\n" if @$rows != 1;
+    die "*** Unexpected result, no count\n" if !exists $rows->[0]->{cnt};
+    print "Count = $rows->[0]->{cnt}\n" if $opts->{verbose};
+    return $rows->[0]->{cnt};
+}
+
+__END__
+
+=head1 NAME
+
+htx-report - HaunTix Summary Report
+
+=head1 SYNOPSIS
+
+ htx-report [options]
+
+ Options:
+  -h    --help          Usage summary
+  -c    --config-file   Alternate config file
+  -d    --date          Event's date n YYYY-MM-DD format, will produce report
+            for 3am given day until 3am next day; default: today
+  -v    --verbose       Verbose output
+
+=head1 DESCRIPTION
+
+Generates an event summary report
+
+=cut

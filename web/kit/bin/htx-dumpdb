@@ -1,0 +1,67 @@
+#!/usr/bin/perl -w
+#
+# Utility to dump the database
+#
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long;
+use Pod::Usage;
+use Term::Emit qw/:all/;
+use Time::HiRes qw/gettimeofday tv_interval/;
+use htx;
+$|=1;
+
+my $opts = {};
+GetOptions ($opts, "help|h",
+                   "config-file|c=s",
+                   "name|n:s",
+                   "webdb|w",
+                   "verbose|v") or pod2usage(2);
+pod2usage(1) if $opts->{help};
+
+# Globals & config
+my $htx = {};    ### TODO: Make this an htx object
+read_config $opts->{'config-file'}||$CONFIG_FILE => $htx->{cfg};
+
+# Dump it
+my $dbdef = $opts->{webdb}? 'dbweb' : 'db';
+my $dbnam = $opts->{name} || ($opts->{webdb}? 'web' : 'boo');
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
+my $tstamp = sprintf "%4.4d%2.2d%2.2d-%2.2d%2.2d%2.2d", $year+1900, $mon+1, $mday, $hour, $min, $sec;
+my $outfile = "hauntix-dump-$dbnam-$tstamp.sql.gz";
+my $cfg  = $htx->{cfg};
+my $db   = $cfg->{$dbdef}->{name};
+my $user = $cfg->{$dbdef}->{user};
+my $pass = $cfg->{$dbdef}->{pass};
+my $host = $cfg->{$dbdef}->{host};
+my $cmd  = "mysqldump -u $user --password=$pass -h $host $db | gzip -9 > $outfile";
+emit "Saving database to $outfile";
+emit_text "Command: $cmd" if $opts->{verbose};
+system("$cmd 2>&1");
+exit 0;
+
+__END__
+
+=head1 NAME
+
+htx-dumpdb - Database dump (save) utility
+
+=head1 SYNOPSIS
+
+ htx-dumpdb
+
+ Options:
+  -h    --help          Usage summary
+  -c    --config-file   Alternate config file
+  -n    --name          Give a different name-part to output file (ie, 'test' or 'home')
+  -w    --webdb         Use web database
+  -v    --verbose       Verbose output
+
+=head1 DESCRIPTION
+
+Dumps the database to a compressed file.
+Uses the mysqlsump utility.
+
+=cut

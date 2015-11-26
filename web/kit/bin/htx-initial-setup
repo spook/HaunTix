@@ -1,0 +1,17 @@
+#!/bin/bash
+echo "Hauntix Initial Setup Script"
+
+echo "  Perl packages"
+sudo perl -MCPAN -e 'install Tk::FmtEntry'
+sudo perl -MCPAN -e 'install Tk::FullKeypad'
+sudo perl -MCPAN -e 'install Tk::NumKeypad'
+sudo perl -MCPAN -e 'install Tk::DoCommand'
+sudo perl -MCPAN -e 'install Scope::Upper'
+sudo perl -MCPAN -e 'install Term::Emit'
+sudo perl -MCPAN -e 'install Proc::Killfam'
+
+echo "\n\n  Database setup"
+mysql -u root -p < /usr/share/htx/hauntix_create.sql
+mysql -u hauntix -p hauntix < /usr/share/htx/hauntix_hm2012_data.sql
+
+

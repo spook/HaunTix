@@ -1,0 +1,134 @@
+#!/usr/bin/perl -w
+use strict;
+use FindBin;
+use Config::Std;
+use DBI;
+use Fcntl qw/:DEFAULT :flock/;
+use Getopt::Long;
+use Pod::Usage;
+use Tk;
+use Tk::ROText;
+use utf8;
+
+use lib "$FindBin::RealBin/../lib";
+use htx;
+use htx::pos_db;
+use htx::pos_bill;
+use htx::pos_func;
+use htx::pos_head;
+use htx::pos_info;
+use htx::pos_itms;
+use htx::pos_nums;
+use htx::pos_pays;
+use htx::pos_style;
+use htx::transaction;
+my $DEBUG = $ENV{'HTX-DEBUG'} || 0;
+
+# Good random seed
+srand (time ^ $$ ^ unpack "%L*", `ps axww | gzip -f`);  # TODO: read from /dev/urandom
+
+# Globals
+my $opts = {};
+my $htx = {opts => $opts};
+#<<<
+GetOptions($opts,   "help|h",
+                    "config-file|c=s",
+                    "verbose|v",
+                    "webdb|w",
+           ) or pod2usage(2);
+#>>>
+pod2usage(1) if $opts->{help};
+
+# Config
+read_config $CONFIG_FILE => $htx->{cfg};
+
+# Database setup
+connect_db($htx);
+load_items($htx);
+
+# Open the first transaction
+$htx->{last_trn} = undef;
+$htx->{trn} = htx::transaction->new(-htx => $htx);
+die "*** Unable to create initial transaction: " . $htx->{trn}->error . "\n"
+    if $htx->{trn}->error;
+
+# Setup and show the GUI
+layout_screen($htx);
+run_alone();
+my $func = $htx->{func};
+$func->dim_by_phase;
+MainLoop;
+exit 0;
+
+                            ####### O #######
+
+# Layout main screen
+sub layout_screen {
+    my $htx = shift;
+    my $mw = $htx->{mw} = MainWindow->new( -background => $COLOR_BG );
+
+    # Set us fullscreen
+    my $sh = $mw->screenheight;
+    my $sw = $mw->screenwidth;
+    $sh = 768 if $sh > 768;     # TEMP
+    $sw = 1024 if $sw > 1024;   # TEMP
+    $sh -= 50;  # TEMP
+    $mw->geometry("${sw}x${sh}+0+0");
+    $mw->resizable( 0, 0 );    # Can't change size
+#    $mw->overrideredirect(1);  # remove all window decorations
+    $mw->title("HaunTix Ticketing System");
+
+    # Screen sections
+    $htx->{head} = htx::pos_head->new($mw, $htx)->fill()->start();
+    $htx->{head}->place(-x =>   0, -y =>   0, @{$htx->{head}->{wantsize}});
+    $htx->{nums} = htx::pos_nums->new($mw, $htx)->fill()->start();
+    $htx->{nums}->place(-x =>   0, -y =>  77, @{$htx->{nums}->{wantsize}});
+    $htx->{itms} = htx::pos_itms->new($mw, $htx)->fill()->start();
+    $htx->{itms}->place(-x => 250, -y =>  77, @{$htx->{itms}->{wantsize}});
+    $htx->{pays} = htx::pos_pays->new($mw, $htx)->fill()->start();
+    $htx->{pays}->place(-x => 660, -y =>  77, @{$htx->{pays}->{wantsize}});
+    $htx->{bill} = htx::pos_bill->new($mw, $htx)->fill()->start();
+    $htx->{bill}->place(-x => 660, -y => 237, @{$htx->{bill}->{wantsize}});
+    $htx->{info} = htx::pos_info->new($mw, $htx)->fill()->start();
+    $htx->{info}->place(-x =>   0, -y => 477, @{$htx->{info}->{wantsize}});
+    $htx->{func} = htx::pos_func->new($mw, $htx)->fill()->start();
+    $htx->{func}->place(-x =>   0, -y => 608, @{$htx->{func}->{wantsize}});  # =< ->
+
+    # Start a recurring updater for the info panel
+    $mw->repeat(15000, sub {$htx->{info}->update()});
+}
+
+# Insure there's only one copy of us running on this system
+sub run_alone {
+    for (1..5) {
+        if (flock main::DATA, LOCK_EX | LOCK_NB) {
+            return;
+        }
+        sleep 1;
+    }
+    htx::pop_error::show($htx, "Another copy of ourselves is running.  Exiting this instance.\n",
+                         -exit => 5);
+}
+
+
+__END__
+
+=head1 NAME
+
+hauntix-pos - HaunTix Point-of-Sale application
+
+=head1 SYNOPSIS
+
+ hauntix-pos [options]
+
+ Options:
+  -c    --config-file   Alternate config file
+  -h    --help          Usage summary
+  -v    --verbose       Verbose output
+  -w    --webdb         Use database specified by web definitions
+
+=head1 DESCRIPTION
+
+Used in ticket booths to sell merchandise and tickets.
+
+=cut

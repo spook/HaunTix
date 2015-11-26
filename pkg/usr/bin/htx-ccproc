@@ -1,0 +1,171 @@
+#!/usr/bin/perl -w
+#
+# Simple command-line interface to credit card processing
+#
+use strict;
+use warnings;
+use lib '../lib';
+use lib ($ENV{HOME}          || q{}) . q{/pm};
+use lib ($ENV{DOCUMENT_ROOT} || q{}) . q{/../pm};
+use Config::Std;
+use Getopt::Long;
+use Pod::Usage;
+use Time::HiRes qw/gettimeofday tv_interval/;
+use htx;
+use htx::cc;
+
+#<<<
+my $opts = {};
+GetOptions ($opts, 
+    "help|h",
+    "account-number|a=s",
+    "batch|b=s",
+    "ccv2|c=s",
+    "config-file|f=s",
+    "duplicate-check|d",
+    "expires|e=s",
+    "transaction-id|x=s",
+    "track|t=s",
+    "verbose|v",
+    "web|w",
+    "uref|u=s",
+    "description|y=s",
+    "invoice|z=s",
+    ) or pod2usage(2);
+pod2usage(1) if $opts->{help};
+#>>>
+my $htx = {};    ### TODO: Make this an htx object
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+
+my $cmd = $ARGV[0] || q{};
+$opts->{expires} =~ s{/}{}mg if $opts->{expires};                      # Cleanup delimiters
+$opts->{'account-number'} =~ s{-}{}mg if $opts->{'account-number'};    # Cleanup delimiters
+exit charge($htx, $opts) if $cmd =~ m/^charge$/i;
+exit refund($htx, $opts) if $cmd =~ m/^refund$/i;
+exit void  ($htx, $opts) if $cmd =~ m/^void$/i;
+pod2usage(1);
+die "*** Invalid command\n";
+
+sub charge {
+    my ($htx, $opts) = @_;
+    my $amt = $ARGV[1] || q{};
+    die "*** Invalid amount, specify dollars like 1.23\n"
+        if $amt !~ m/^\d+(\.\d{0,2})?/;
+    my $t0     = [gettimeofday];
+    my $useweb = $opts->{web} ? 1 : 0;
+    my $rsp    = htx::cc::charge(
+        $htx,
+        AcctNum  => $opts->{'account-number'} || q{},
+        ExpDate  => $opts->{expires}          || q{},
+        CardCode => $opts->{ccv2}             || q{},
+        Track    => $opts->{track}            || q{},
+        CheckDups => $opts->{'duplicate-check'} || 0,
+        Amount        => $amt,
+        UseWeb        => $useweb,
+        URef          => $opts->{uref} || q{},
+        Description   => $opts->{description} || q{},
+        Invoice       => $opts->{invoice} || q{}
+    );
+    die "*** No response from processor\n" if !$rsp;
+    my $elapsed = tv_interval($t0, [gettimeofday]);
+
+    foreach my $k (sort keys %$rsp) {
+        printf "\%-26s => \%s\n", $k, $rsp->{$k};
+    }
+    print "Elapsed time $elapsed seconds\n";
+    return 0 if $rsp->{ResponseCode} eq "000";
+    return 1;
+}
+
+sub refund {
+    my ($htx, $opts) = @_;
+    my $amt = $ARGV[1] || q{};
+    die "*** Must supply cc transaction id\n" if !$opts->{'transaction-id'};
+    die "*** Invalid amount, specify dollars like 1.23\n"
+        if $amt !~ m/^\d+(\.\d{0,2})?/;
+    my $t0     = [gettimeofday];
+    my $useweb = $opts->{web} ? 1 : 0;
+    my $rsp    = htx::cc::refund(
+        $htx,
+        Track    => $opts->{track}            || q{},
+        AcctNum  => $opts->{'account-number'} || q{},
+        ExpDate  => $opts->{expires}          || q{},
+        CardCode => $opts->{ccv2}             || q{},
+        CheckDups => $opts->{'duplicate-check'} || 0,
+        Amount        => $amt,
+        UseWeb        => $useweb,
+        TransactionId => $opts->{'transaction-id'},
+        URef          => $opts->{uref} || q{},
+        Description   => $opts->{description} || q{},
+        Invoice       => $opts->{invoice} || q{}
+    );
+    die "*** No response from processor\n" if !$rsp;
+    my $elapsed = tv_interval($t0, [gettimeofday]);
+
+    foreach my $k (sort keys %$rsp) {
+        printf "\%-26s => \%s\n", $k, $rsp->{$k};
+    }
+    print "Elapsed time $elapsed seconds\n";
+    return 0 if $rsp->{ResponseCode} eq "000";
+    return 1;
+}
+
+sub void {
+    my ($htx, $opts) = @_;
+    my $batchnum = $ARGV[1] || q{};
+    my $useweb = $opts->{web} ? 1 : 0;
+    die "*** Must supply cc transaction id\n" if !$opts->{'transaction-id'};
+
+    my $t0  = [gettimeofday];
+    my $rsp = htx::cc::void(
+        $htx,
+        TransactionId => $opts->{'transaction-id'},
+        UseWeb        => $useweb,
+        URef          => $opts->{uref} || q{},
+        Description   => $opts->{description} || q{},
+        Invoice       => $opts->{invoice} || q{}
+    );
+    die "*** No response from processor\n" if !$rsp;
+
+    my $elapsed = tv_interval($t0, [gettimeofday]);
+    foreach my $k (sort keys %$rsp) {
+        printf "\%-26s => \%s\n", $k, $rsp->{$k};
+    }
+    print "Elapsed time $elapsed seconds\n";
+    return 0 if $rsp->{ResponseCode} eq "000";
+    return 1;
+}
+
+__END__
+
+=head1 NAME
+
+htx-ccproc - Simple interface to credit card processing
+
+=head1 SYNOPSIS
+
+ htx-ccproc [options] charge amount
+ htx-ccproc [options] refund amount
+ htx-ccproc [options] void
+
+ Options:
+  -h    --help              Usage summary
+  -a    --account-number    Card account number
+  -c    --ccv2              Card verification code
+  -d    --duplicate-check   Enable duplicate checking
+  -e    --expires           Expiration date (MM/YY)
+  -x    --transaction-id    Transaction ID (req'd for refund)
+  -t    --track             Track data from swipe
+  -w    --web               Use Web (e-commerce) gateway
+  -f    --config-file       Alternate configuration file
+  -u    --uref              Optional tie-back user ref (max 255 chars)
+  -v    --verbose           Verbose mode
+  -y    --description       Optional description (max 255 chars)
+  -z    --invoice           Transaction # or invoice # (max 20 chars)
+
+=head1 DESCRIPTION
+
+Command line interface to the credit card processing gateway.
+
+=cut
+

@@ -1,0 +1,916 @@
+#!/usr/bin/perl -w
+#=============================================================================
+#
+# Hauntix Point of Sale - PDF Ticket and Receipt Creator and Mailer
+#   Creates a PDF file containing one or more tickets and/or a receipt
+#
+#-----------------------------------------------------------------------------
+
+### TODO:
+###     If not using verbose, an emit_error() without a matching emit()
+###         returns undef.  This causes exit's to fail.
+###     Add ticket sections based on the tixState - so we can put a "VOID" on voided tickets,
+###         a "Used" and slash (whatever) on used tickets, etc...  The layout defines what is added.
+###     Show Transaction State on the receipt page.
+
+use strict;
+use warnings;
+use lib ($ENV{HOME}          || q{}) . q{/pm};
+use lib ($ENV{DOCUMENT_ROOT} || q{}) . q{/../pm};
+
+# better debug output
+use Carp 'verbose';
+$SIG{__DIE__} = sub {Carp::confess(@_)};
+
+use Config::Std;
+use Date::Manip;
+use File::Basename;
+use Getopt::Long;
+use htx;
+use htx::db;
+use htx::transaction;
+use htx::sale;
+use htx::show;
+use htx::ticket;
+use MIME::Lite;
+use Net::SMTP;
+use PDF::API2;
+use Pod::Usage;
+use Term::Emit qw/:all/;
+
+use constant mm => 25.4 / 72;
+use constant cm => 2.54 / 72;
+use constant in => 1 / 72;
+use constant pt => 1;
+
+my $LX = 0;    # Last given position, X
+my $LY = 0;    # Last given position, Y
+
+# Command line options
+my $opts = {};
+my $htx = {opts => $opts};
+#<<<
+GetOptions($opts,   "help|h",
+                    "config-file|c=s",
+                    "delete-file|d",
+                    "tickets|k",
+                    "layout|l=s",
+                    "mailto|m=s",
+                    "receipt|r",
+                    "trnid|t=s",
+                    "output-file|o=s",
+                    "verbose|v",
+                    "webdb|w",
+                    "debug",  # not advertised
+           ) or pod2usage(2);
+#>>>
+pod2usage(1) if $opts->{help};
+if (!$opts->{trnid}) {
+    warn "*** Transaction ID is required\n";
+    pod2usage(1);
+}
+
+# Globals & config
+load_cfg($htx);
+
+# Database setup
+init_db($htx);
+
+# Find the transaction
+find_trn($htx);
+
+# Setup PDF file
+init_pdf($htx);
+
+# Generate sections
+$htx->{pmax} = $opts->{receipt} || !$opts->{tickets} ? 1 : 0;
+generate_all_tickets($htx) if $opts->{tickets} || !$opts->{receipt};
+generate_receipt($htx)     if $opts->{receipt} || !$opts->{tickets};
+
+# Complete PDF file
+close_pdf($htx);
+
+# Mail it
+send_mail($htx) if $opts->{mailto};
+
+exit 0;
+
+#                               ### O ###
+
+# Create a ticket page; working area is 7.5" x 10"
+sub create_new_page {
+    my $htx    = shift;
+    my $pdf    = $htx->{pdf};
+    my $layout = $htx->{layout};
+    my $type   = shift || 'tixpage';    # tixpage or rctpage
+    my ($pnum, $pmax) = @_;
+
+    my $opts = $htx->{opts};
+    emit "Create page $pnum of $pmax" if $opts->{verbose};
+
+    # Fields
+    my $f = $htx->{fields};
+    $f->{pnum} = $pnum;
+    $f->{pmax} = $pmax;
+
+    # Create a new page
+    my $page = $htx->{currpage} = $pdf->page;
+
+    # Page's GFX object and defaults
+    my $gfx = $page->gfx;
+    $gfx->fillcolor('#808080');
+    $gfx->strokecolor('black');
+    $gfx->linewidth(1);
+    $gfx->linedash();    #solid
+    $htx->{gfx} = $gfx;
+
+    # Page's text object and defaults
+    my $text = $page->text;
+    $text->fillcolor('black');
+    $text->font($htx->{fonts}->{courier}, 12 / pt);
+    $htx->{text} = $text;
+
+    # Draw the page-level layout objects
+    foreach my $k (sort keys %$layout) {
+        next unless $k =~ /^$type\.\d+\.(\S+)$/;
+        my $obj  = lc $1;
+        my $vals = $layout->{$k};
+        die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+        draw_obj($htx, 0, 0, $obj, $vals);
+    }
+
+    # Done
+    return $htx->{currpage};
+}
+
+# Since the PDF::API2 barcodes don't work, we draw our own
+#   barcode(
+#       -page => $page,         # Page to draw this on, required
+#       -text => $text,         # The text we're encoding, required
+#       -barcolor => $color,    # Color of the bar, default=black
+#       -textcolor => $color,   # Color of the HRI text, default=black
+#       -textfont => $fnt,      # Font for the HRI text, default=Helvetica
+#       -textsize => 12,        # Point size of the HRI text, default=12pt
+#       -textspot => 1,         # Where to show HRI text, 0=not shown, default=1, 0-5
+#       -x => $x, -y => $y,     # Position of start corner
+#       -height => $height,     # Height of bars, default 36pt
+#       -barwidth => $bwid,     # Width of one unit bar, default 1.5pt
+#       -rotate => $angle,      # Rotation angle for whole thing
+#       );
+sub draw_barcode {
+    my $htx  = shift;
+    my $pdf  = $htx->{pdf};
+    my $page = $htx->{currpage};
+
+    my %args = @_;
+    my $text = $args{'-text'};
+    die "*** No -text given to barcode()\n"
+        if !exists $args{'-text'};
+    my $x0 = $args{'-x'}      || 0;
+    my $y0 = $args{'-y'}      || 0;
+    my $h  = $args{'-height'} || 36;
+    my $w  = $args{'-width'}  || 1.5;    # pts
+    my $fat = $args{'-thickness'}
+        || 0.93;    # thickness of a bar in its width; accounts for ink bleed (0.0-1.0)
+    my $r         = $args{'-rotate'}    || 0;
+    my $barcolor  = $args{'-barcolor'}  || 'black';
+    my $textcolor = $args{'-textcolor'} || 'black';
+    my $textfont  = $args{'-textfont'}  || 'Helvetica';
+    my $textsize  = $args{'-textsize'}  || 12;
+
+    # Make a barcode string of spaces and hashes
+    require Barcode::Code128;    # PDF::API2 barcodes are bad; we use this to make our own.
+    my $bc    = new Barcode::Code128;
+    my $bcstr = $bc->barcode($text);
+
+    # Transform the coordinate system into place
+    my $gfx = $page->gfx;
+    $gfx->save;
+    $gfx->transform(
+        -translate => [$x0, $y0],
+        -rotate    => $r,
+    );
+
+    # Draw the bars
+    my $x = -$w * length($bcstr) / 2;
+    $gfx->fillcolor($barcolor);
+    foreach my $b (split //, $bcstr) {
+        if ($b ne q{ }) {
+            $gfx->rect($x, $textsize, $w * $fat, $h);
+            $gfx->fill;
+        }
+        $x += $w;
+    }
+
+    # Draw the HRI text
+    my $txt = $page->text;
+    my $font = $htx->{fonts}->{$textfont} || $htx->{fonts}->{courier};
+    $txt->font($font, $textsize);
+    $txt->fillcolor($textcolor);
+    $txt->transform(
+        -translate => [$x0, $y0],
+        -rotate    => $r,
+    );
+    my $spaced_text = join(' ', split(//, $text));
+    $txt->text_center($spaced_text);
+
+    $gfx->restore;
+}
+
+# Close the PDF file
+sub close_pdf {
+    my $htx  = shift;
+    my $opts = $htx->{opts};
+    my $pdf  = $htx->{pdf};
+    $pdf->save();
+    print "Result file: " if $opts->{verbose};
+    print $htx->{pdfnam} . "\n";
+}
+
+# Draw an object or set a context
+sub draw_obj {
+    my $htx  = shift;
+    my $gfx  = $htx->{gfx};
+    my $text = $htx->{text};
+
+    my $dx   = shift;
+    my $dy   = shift;
+    my $obj  = shift;
+    my $vals = shift;
+
+    my $pdf = $htx->{pdf};
+
+    # stroke: strokecolor linewidth linedash-on linedash-off
+    if ($obj eq 'stroke') {
+        my ($color, $width, $d0, $d1) = split(/\s+/, $vals, 4);
+        emit_text "$obj: $color, $width, $d0, $d1" if $opts->{debug};
+        $gfx->strokecolor($color) if $color ne '-';
+        $gfx->linewidth(to_pts($width)) if $width ne '-';
+        if ($d0 ne '-') {
+                  $d0 && $d1 ? $gfx->linedash(to_pts($d0), to_pts($d1))
+                : $d0 || $d1 ? $gfx->linedash(to_pts($d0) || to_pts($d1))
+                :              $gfx->linedash();
+        }
+    }
+
+    # fill:   fillcolor
+    elsif ($obj eq 'fill') {
+        emit_text "$obj: $vals" if $opts->{debug};
+        $gfx->fillcolor($vals) if $vals && ($vals ne '-');
+    }
+
+    # rect:   x y w h
+    elsif ($obj eq 'rect') {
+        my ($x, $y, $w, $h) = split(/\s+/, $vals, 4);
+        ($LX, $LY) = to_rel(to_pts($x), to_pts($y));
+        emit_text "$obj: $x -> $LX, $y -> $LY, $w, $h" if $opts->{debug};
+        $gfx->rect($dx + $LX, $dy + $LY, to_pts($w), to_pts($h));
+        $gfx->stroke;
+    }
+
+    # line:   x0 y0 x1 y1
+    elsif ($obj eq 'line') {
+        my ($x0, $y0, $x1, $y1) = split(/\s+/, $vals, 4);
+        ($LX, $LY) = to_rel(to_pts($x0), to_pts($y0));
+        emit_text "$obj: $x0 -> $LX, $y0 -> $LY, $x1, $y1" if $opts->{debug};
+        $gfx->move($dx + $LX, $dy + $LY);
+        ($LX, $LY) = to_rel(to_pts($x1), to_pts($y1));
+        $gfx->line($dx + $LX, $dy + $LY);
+        $gfx->stroke;
+    }
+
+    # poly:   x0 y0 x1 y1 ... xn yn
+    elsif ($obj eq 'poly') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # curve:  x0 y0 cx1 cy1 cx2 cy2 x1 y1
+    elsif ($obj eq 'curve') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # spline: x0 y0 cx1 cy1 x1 y1
+    elsif ($obj eq 'spline') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # arc:    x0 y0 xc yc a b alpha beta
+    elsif ($obj eq 'arc') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # circle: xc yx r
+    elsif ($obj eq 'circle') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # elipse: xc yx a b
+    elsif ($obj eq 'elipse') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # pie:    xc yc a b alpha beta
+    elsif ($obj eq 'pie') {
+        warn "--- $obj not yet implemented\n";
+    }
+
+    # barcode: xc yc r bw h value
+    elsif ($obj eq 'barcode') {
+        my ($xc, $yc, $r, $bw, $h, $value) = split(/\s+/, $vals, 6);
+        ($LX, $LY) = to_rel(to_pts($xc), to_pts($yc));
+        emit_text "$obj: $xc -> $LX, $yc -> $LY, $r, $bw, $h, $value" if $opts->{debug};
+        draw_barcode(
+            $htx,
+            -rotate   => $r,
+            -height   => to_pts($h),
+            -barwidth => to_pts($bw),
+            '-x'      => $dx + $LX,
+            '-y'      => $dy + $LY,
+            -text     => fldsub($htx, $value),
+        );
+    }
+
+    # image:  x0 y0 w h imagefile
+    elsif ($obj eq 'image') {
+        my ($x0, $y0, $w, $h, $file) = split(/\s+/, $vals, 5);
+        ($LX, $LY) = to_rel(to_pts($x0), to_pts($y0));
+        emit_text "$obj: $x0 -> $LX, $y0 -> $LY, $w, $h, $file" if $opts->{debug};
+        if (!$htx->{images}->{$file}) {
+            $htx->{images}->{$file} = $pdf->image_jpeg($file) if $file =~ m/\.jpe?g$/i;
+            $htx->{images}->{$file} = $pdf->image_png($file)  if $file =~ m/\.png$/i;
+        }
+        die "*** Unsupported image type for file $file\n" if !$htx->{images}->{$file};
+        $gfx->image($htx->{images}->{$file}, $dx + $LX, $dy + $LY, to_pts($w), to_pts($h));
+    }
+
+    # font:   black Helvetica 12pt
+    elsif ($obj eq 'font') {
+        my ($color, $name, $size) = split(/\s+/, $vals, 3);
+        emit_text "$obj: $color, $name, $size" if $opts->{debug};
+        $htx->{fontname} = $name if $name ne '-';
+        my $fo = $htx->{fonts}->{lc $htx->{fontname}} || $htx->{fonts}->{courier};
+        $htx->{fontsize} = to_pts($size) if $size ne '-';
+        $text->font($fo, $htx->{fontsize});
+        $text->fillcolor($color);
+    }
+
+    # text:   (L|C|R) x y r text...
+    elsif ($obj eq 'text') {
+        my ($lrc, $x, $y, $r, $str) = split(/\s+/, $vals, 5);
+        ($LX, $LY) = to_rel(to_pts($x), to_pts($y));
+        emit_text "$obj: $lrc, $x -> $LX, $y -> $LY, $r, \"$str\"" if $opts->{debug};
+        $text->transform(
+            -translate => [$dx + $LX, $dy + $LY],
+            -rotate    => $r
+        ) if $x ne '-' and $y ne '-';
+
+        # Write it
+              uc($lrc) eq 'R' ? $text->text_right(fldsub($htx, $str))
+            : uc($lrc) eq 'C' ? $text->text_center(fldsub($htx, $str))
+            :                   $text->text(fldsub($htx, $str));
+    }
+
+    # cr:   (no values) - a text carriage return using last font size plus one
+    elsif ($obj eq 'cr') {
+        emit_text "$obj: $vals" if $opts->{debug};
+        $text->cr(-($htx->{fontsize} + 1));
+    }
+    else {
+        warn "*** unknown layout object '$obj'\n";
+    }
+}
+
+# Transaction lookup
+sub find_trn {
+    my $htx  = shift;
+    my $opts = $htx->{opts};
+    emit "Transaction lookup" if $opts->{verbose};
+    $htx->{trn} = htx::transaction->load(-htx => $htx, -trnId => $opts->{trnid});
+    exit emit_error {-reason => $htx->{trn}->error} if $htx->{trn}->error;
+
+    #    exit emit_error {-reason => "Transaction must be final (is '"
+    #                              . $htx->{trn}->phase()
+    #                              . "')"}
+    #        if $htx->{trn}->phase ne $TRN_PHASE_FIN;
+}
+
+# Initialize the database
+sub init_db {
+    my $htx   = shift;
+    my $opts  = $htx->{opts};
+    my $dbloc = $opts->{webdb} ? $htx->{cfg}->{dbweb} : $htx->{cfg}->{db};
+    emit "Connecting to database at $dbloc->{host}" if $opts->{verbose};
+    my $db = new htx::db;
+    $htx->{db} = $db;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->connect($dbloc);
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->setup;
+    exit emit_error {-reason => $db->error} if $db->error;
+}
+
+# Initialize the PDF file
+sub init_pdf {
+    my $htx   = shift;
+    my $cfg   = $htx->{cfg};
+    my $opts  = $htx->{opts};
+    my $trn   = $htx->{trn};
+    my $trnid = $trn->trnid();
+    emit "Initializing PDF contents" if $opts->{verbose};
+
+    # Create the PDF object and PDF file
+    $htx->{pdfnam} = $opts->{'output-file'}
+        || 'htx-tix-' . $htx->{trn}->fmtpickup() . '.pdf';
+    my $pdf = $htx->{pdf} = PDF::API2->new(-file => $htx->{pdfnam});
+    $pdf->preferences(
+        -fullscreen => 0,
+        -onecolumn  => 1,
+    );
+    my $event_name = $cfg->{haunt}->{name} || 'Our Event';
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(time);
+    my $credat = sprintf q{D:%4.4d%2.2d%2.2d%2.2d%2.2d%2.2d+%2.2d'00'},
+        1900 + $year, $mon + 1, $mday, $hour, $min, $sec, $isdst ? 1 : 0;
+    $pdf->info(
+        'Author' => $ENV{USER} || "--htx user--",
+        'CreationDate' => $credat,
+        'ModDate'      => q{},
+        'Creator'      => "HaunTix $htx::HTX_VERSION Ticketing System",
+        'Producer'     => "PDF::API2",
+        'Title'        => "$event_name Tickets and/or Receipt",
+        'Subject'      => "TID $trnid",
+        'Keywords'     => "$event_name, tickets, receipt",
+    );
+
+    my ($mw, $mh) = split(/\s*x\s*/, $cfg->{'layout.tix.web'}->{media_size} || q{8.5in x 11in});
+    $mw = to_pts($mw);
+    $mh = to_pts($mh);
+    emit_text "Media size ($mw x $mh) pts" if $opts->{debug};
+    $htx->{media_size} = [$mw, $mh];
+    $pdf->mediabox($mw, $mh);
+    $pdf->cropbox(0 / in, 0 / in, $mw, $mh);
+
+    # Fonts
+    foreach my $fonam (qw/Courier Helvetica Symbol Times/) {
+        $htx->{fonts}->{lc $fonam} = $pdf->corefont($fonam);
+    }
+
+    # Fields
+    my $f = $htx->{fields} = {};
+    $f->{event}->{intro}            = $cfg->{haunt}->{intro}            || q{};
+    $f->{event}->{name}             = $cfg->{haunt}->{name}             || 'Our Event';
+    $f->{event}->{desc}             = $cfg->{haunt}->{desc}             || q{};
+    $f->{event}->{slogan}           = $cfg->{haunt}->{slogan}           || q{};
+    $f->{event}->{site}             = $cfg->{haunt}->{site}             || q{};
+    $f->{event}->{website}          = $cfg->{haunt}->{website}          || q{};
+    $f->{event}->{phone}            = $cfg->{haunt}->{phone}            || q{};
+    $f->{event}->{addr0}            = $cfg->{haunt}->{addr0}            || q{};
+    $f->{event}->{addr1}            = $cfg->{haunt}->{addr1}            || q{};
+    $f->{event}->{addr2}            = $cfg->{haunt}->{addr2}            || q{};
+    $f->{event}->{refund_policy}    = $cfg->{haunt}->{refund_policy}    || q{};
+    $f->{event}->{refund_statement} = $cfg->{haunt}->{refund_statement} || q{};
+    $f->{event}->{refund_type}      = $cfg->{haunt}->{refund_type}      || q{};
+    $f->{event}->{parking_statement} = $cfg->{haunt}->{parking_statement} || q{};
+    $f->{event}->{arrival_policy}   = $cfg->{haunt}->{arrival_policy}
+        || q{Please arrive 5 minutes early.};
+
+    $f->{trnId}         = $trnid;
+    $f->{trnPickupCode} = $trn->fmtpickup();
+    $f->{trnTimestamp}  = $trn->{trnTimestamp} || q{};
+    $f->{trnUser}       = $trn->{trnUser} || q{};
+    $f->{trnStation}    = $trn->{trnStation} || q{};
+    $f->{trnCode}       = $trn->{trnPickupCode} || q{};
+    $f->{trnNote}       = $trn->{trnNote} || q{};
+
+    $f->{trnDate} = "--";
+    $f->{trnTime} = "--";
+    ($f->{trnDate},$f->{trnTime}) = ($1, $2) if $trn->{trnTimestamp} =~ m/(\S+)\s+(\S+)/;
+}
+
+# Load the configuration file contents
+sub load_cfg {
+    my $htx  = shift;
+    my $opts = $htx->{opts};
+    emit "Loading configuration" if $opts->{verbose};
+    read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+}
+
+# Send email
+sub send_mail {
+    my $htx  = shift;
+    my $cfg  = $htx->{cfg};
+    my $opts = $htx->{opts};
+    emit "Sending mail to $opts->{mailto}" if $opts->{verbose};
+
+    # filename is $htx->{pdfnam}
+    # to $opts->{mailto}
+
+    my $event_name = $cfg->{haunt}->{name} || 'event';
+    my $subj       = "Your $event_name Tickets and Receipt (t# $opts->{trnid})";
+    my $from       = $cfg->{haunt}->{ticket_email_from}
+        || 'WebTickets@hauntedmines.org';    ### TODO: better default
+    my $to = $opts->{mailto};
+
+    # Create the multipart container
+    my $mail = MIME::Lite->new(
+        From    => $from,
+        To      => $to,
+        Subject => $subj,
+        Type    => 'multipart/mixed'
+    ) or return emit_fail {reason => "Error creating multipart container: $!"};
+
+    # Add the message test  ### TODO: Config value
+    my $bodytext = $cfg->{haunt}->{ticket_email_text} || qq{
+Thank you for your recent $event_name purchase.  Your tickets and receipt are
+attached to this email as one PDF file.  Please print the tickets and bring them
+with you to the event.
+};
+    ### TODO: $htx->{fields} may not always have waht we want in it, verify it does    
+    $mail->attach(
+        Type => 'TEXT',
+        Data => fldsub($htx, $bodytext),
+    ) or return emit_fail {reason => "Error adding the text message part: $!"};
+
+    # Add the PDF attachment
+    $mail->attach(
+        Type        => 'application/pdf',
+        Path        => $htx->{pdfnam},
+        Filename    => basename($htx->{pdfnam}),
+        Disposition => 'attachment'
+    ) or return emit_fail {reason => "Error adding attachment $htx->{pdfnam}: $!"};
+
+    # Send the email
+    $mail->send
+        or return emit_fail {reason => "Error sending mail: $!"};
+}
+
+# Produce the PDF file with *all* the tickets in the transaction
+sub generate_all_tickets {
+    my $htx   = shift;
+    my $opts  = $htx->{opts};
+    my $cfg   = $htx->{cfg};
+    my $fonts = $htx->{fonts};
+    my $pdf   = $htx->{pdf};
+    my $trn   = $htx->{trn};
+    my $trnid = $trn->trnid();
+    emit "Generating tickets" if $opts->{verbose};
+
+    # Load ticket box positions
+    my $layout = $htx->{layout} = $cfg->{'layout.tix.web'};
+    $htx->{tpos} = [];    # Ticket positions
+    foreach my $k (sort keys %$layout) {
+        next unless $k =~ m/^tixbox\.position\./;
+        my ($x, $y) = split(/\s+/, $layout->{$k});
+        push @{$htx->{tpos}}, [$x, $y];
+    }
+    die "*** no tixbox positions defined in layout!\n"
+        if !@{$htx->{tpos}};
+
+    # Create each page of tickets
+    my $tpp = $htx->{tpp} = @{$htx->{tpos}};                      # Tickets per page
+    my $tnum = 0;                                                 # Ticket number
+    my $pnum = 0;                                                 # Page number
+    my $ntix = @{$trn->{tickets}};                                # Number of tickets
+    my $pmax = $htx->{pmax} += int(($ntix + $tpp - 1) / $tpp);    # Last page number
+    for my $tix (@{$trn->{tickets}}) {
+
+        # Create new page?
+        create_new_page($htx, 'tixpage', ++$pnum, $pmax) if ($tnum++ % $tpp) == 0;
+
+        # Build the ticket
+        generate_one_ticket($htx, $tix, $tnum, $ntix);
+    }
+
+    # No tickets?
+    if (!$ntix) {
+        my $page = create_new_page($htx, 'tixpage', 1, 1);
+        my ($mw, $mh) = @{$htx->{media_size}};
+        my $text = $page->text;
+        $text->font($fonts->{helvetica}, 13 / pt);
+        $text->fillcolor('black');
+        $text->translate($mw / 2, $mh / 2);
+        $text->text_center('There are no tickets for this transaction.');
+    }
+}
+
+# Generate a ticket on the page
+sub generate_one_ticket {
+    my $htx = shift;
+    my $tix = shift;
+    my ($tnum, $tmax) = @_;
+
+    my $opts = $htx->{opts};
+    emit "Generating ticket $tnum of $tmax" if $opts->{verbose};
+
+    my $cfg    = $htx->{cfg};
+    my $pdf    = $htx->{pdf};
+    my $tpp    = $htx->{tpp};
+    my $layout = $htx->{layout};
+    my $page   = $htx->{currpage};
+    my $gfx    = $htx->{gfx};
+    my $text   = $htx->{text};
+
+    my $trn   = $htx->{trn};
+    my $trnid = $trn->trnid();
+    my $sale  = $tix->{sale};
+    my $show  = $tix->{show};
+
+    # Figure ticket position (dx,dy) offsets for the tixbox
+    my $tpos = ($tnum - 1) % $tpp;
+    my ($dx, $dy) = @{$htx->{tpos}->[$tpos]};
+
+    # Fields
+    my $f = $htx->{fields};
+    $f->{tnum} = $tnum;
+    $f->{tmax} = $tmax;
+
+    $f->{tixno}    = $tix->tixno();
+    $f->{tixId}    = $tix->{tixId};
+    $f->{tixCode}  = $tix->{tixCode};
+    $f->{tixPool}  = $tix->{tixPool};
+    $f->{tixState} = $tix->{tixState} || q{-};
+    $f->{tixNote}  = $tix->{tixNote} || q{};
+
+    $f->{salName} = $sale->{salName} || 'General Admission';    ### ||-part is TEMP
+    $f->{salCost} = dollars($sale->{salCost} || 0);
+    $f->{salPaid} = dollars($sale->{salPaid} || 0);
+    $f->{salQuantity} = $sale->{salQuantity} || 0;
+
+    $f->{shoClass} = $show->{shoClass} || 'REG';                ### ||-part is TEMP
+    $f->{shoCost} = dollars($show->{shoCost} || 0);
+    my $when1
+        = $sale->{salIsTimed}    ? UnixDate($show->{shoTime}, q{%a %d-%b-%Y %H:%M})
+        : 1||$sale->{salIsDaily} ? UnixDate($show->{shoTime}, q{%a %d-%b-%Y})   # TEMP:Forced daily
+        : $f->{salName};
+    $when1 =~ s/AM$/a/;
+    $when1 =~ s/PM$/p/;
+    $f->{shoTime1} = $when1;
+
+    my $when2
+        = $sale->{salIsTimed}    ? UnixDate($show->{shoTime}, q{%I:%M%p %a - %d %b})
+        : 1||$sale->{salIsDaily} ? UnixDate($show->{shoTime}, q{%a - %d %b})    # TEMP:Forced daily
+        : $f->{salName};
+    $when2 =~ s/^0//g;
+    ###$when2 =~ s/\s0//g;
+    $when2 =~ s/AM/am/;
+    $when2 =~ s/PM/pm/;
+    $f->{shoTime2} = $when2;
+
+    # Draw the items
+    foreach my $k (sort keys %$layout) {
+        next unless $k =~ /^tixbox\.\d+\.(\S+)$/;
+        my $obj  = lc $1;
+        my $vals = $layout->{$k};
+        die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+        draw_obj($htx, $dx, $dy, $obj, $vals);
+    }
+
+    # Ticket-state specific drawing
+    my $lc_tixState = lc($tix->{tixState}) || q{};
+    foreach my $k (sort keys %$layout) {
+        next unless $k =~ /^tixbox\.state-$lc_tixState\.\d+\.(\S+)$/;
+        my $obj  = lc $1;
+        my $vals = $layout->{$k};
+        die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+        draw_obj($htx, $dx, $dy, $obj, $vals);
+    }
+
+}
+
+# Generate a receipt for this transaction
+sub generate_receipt {
+    my $htx    = shift;
+    my $trn    = $htx->{trn};
+    my $opts   = $htx->{opts};
+    my $layout = $htx->{layout};
+    my $f      = $htx->{fields};
+
+    emit "Generating receipt page" if $opts->{verbose};
+
+    # Draw the static parts of the receipt page
+    create_new_page($htx, 'rctpage', $htx->{pmax}, $htx->{pmax});
+
+    # Show ticket products first
+    foreach my $sale ($trn->sales()) {
+        next unless $sale->{salType} eq 'prd';
+        next unless $sale->{salIsTicket};
+
+        # Load this sale data into the line item
+        $f->{sale}        = $sale;
+        $f->{sale}->{per} = q{\\} . dollar($sale->{salPaid});
+        $f->{sale}->{tot} = q{\\} . dollar($sale->{salPaid} * $sale->{salQuantity});
+        $f->{sale}->{istax} = $sale->{salIsTaxable} ? q{T} : q{ };
+
+        $f->{sale}->{salFullName} = $f->{sale}->{salName};
+        if ($sale->{show}) {
+            my $show = $sale->{show}; 
+            my $nite = substr($show->{shoTime}, 0, 10);
+            $f->{sale}->{salFullName} .= " - Valid for $nite Only";
+        }
+
+        # Draw one line item
+        foreach my $k (sort keys %$layout) {
+            next unless $k =~ /^rctpage\.tixitem\.\d+\.(\S+)$/;
+            my $obj  = lc $1;
+            my $vals = $layout->{$k};
+            die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+            draw_obj($htx, 0, 0, $obj, $vals);
+        }
+    }
+
+    # Show non-ticket products (merchandise)
+    foreach my $sale ($trn->sales()) {
+        next unless $sale->{salType} eq 'prd';
+        next if $sale->{salIsTicket};
+
+        # Load this sale data into the line item
+        $f->{sale}        = $sale;
+        $f->{sale}->{per} = q{\\} . dollar($sale->{salPaid});
+        $f->{sale}->{tot} = q{\\} . dollar($sale->{salPaid} * $sale->{salQuantity});
+        $f->{sale}->{istax} = $sale->{salIsTaxable} ? q{T} : q{ };
+
+        # Draw one line item
+        foreach my $k (sort keys %$layout) {
+            next unless $k =~ /^rctpage\.mchitem\.\d+\.(\S+)$/;
+            my $obj  = lc $1;
+            my $vals = $layout->{$k};
+            die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+            draw_obj($htx, 0, 0, $obj, $vals);
+        }
+    }
+
+    # Then show upgrades
+    foreach my $sale ($trn->sales()) {
+        next unless $sale->{salType} eq 'upg';
+
+        # Load this sale data into the line item
+        $f->{sale}        = $sale;
+        $f->{sale}->{per} = q{\\} . dollar($sale->{salPaid});
+        $f->{sale}->{tot} = q{\\} . dollar($sale->{salPaid} * $sale->{salQuantity});
+        $f->{sale}->{istax} = $sale->{salIsTaxable} ? q{T} : q{ };
+
+        # Draw one line item
+        foreach my $k (sort keys %$layout) {
+            next unless $k =~ /^rctpage\.upgitem\.\d+\.(\S+)$/;
+            my $obj  = lc $1;
+            my $vals = $layout->{$k};
+            die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+            draw_obj($htx, 0, 0, $obj, $vals);
+        }
+    }
+
+    # Next, show discounts
+    foreach my $sale ($trn->sales()) {
+        next unless $sale->{salType} eq 'dsc';
+
+        # Load this sale data into the line item
+        $f->{sale}        = $sale;
+        $f->{sale}->{per} = q{\\} . dollar($sale->{salPaid});
+        $f->{sale}->{per} =~ s/\\-\$/-\\\$/; # fixup escape when negative
+        $f->{sale}->{tot} = q{\\} . dollar($sale->{salPaid} * $sale->{salQuantity});
+        $f->{sale}->{tot} =~ s/\\-\$/-\\\$/; # fixup escape when negative
+        $f->{sale}->{istax} = $sale->{salIsTaxable} ? q{T} : q{ };
+
+        # Draw one line item
+        foreach my $k (sort keys %$layout) {
+            next unless $k =~ /^rctpage\.dscitem\.\d+\.(\S+)$/;
+            my $obj  = lc $1;
+            my $vals = $layout->{$k};
+            die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+            draw_obj($htx, 0, 0, $obj, $vals);
+        }
+    }
+
+    # Lastly, subtotals, taxes, service charges, totals, change
+    $f->{trn}->{subtotal}  = q{\\} . dollars($trn->subtotal());
+    $f->{trn}->{taxrate}   = sprintf('%4.2f', $trn->taxrate()) . q{%};
+    $f->{trn}->{tax}       = q{\\} . dollars($trn->tax());
+    $f->{trn}->{servicecharge} = q{\\} . dollars($trn->servicecharge());
+    $f->{trn}->{total}     = q{\\} . dollars($trn->total());
+    $f->{trn}->{cash}      = q{\\} . dollars($trn->cash());
+    $f->{trn}->{checkinfo} = $trn->checkinfo() || q{};
+    $f->{trn}->{check}     = q{\\} . dollars($trn->check());
+    $f->{trn}->{change}    = q{\\} . dollars($trn->change());
+    foreach my $k (sort keys %$layout) {
+        next unless $k =~ /^rctpage\.totals\.\d+\.(\S+)$/;
+        my $obj  = lc $1;
+        my $vals = $layout->{$k};
+        die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+        draw_obj($htx, 0, 0, $obj, $vals);
+    }
+    foreach my $chg ($trn->charges) {
+        next if $chg->rcode != 0;    ### *** TODO:  Is it "000" or 0 or ??? for good status???
+        $f->{trn}->{masked} = $chg->{chgMaskedAcctNum};
+        $f->{trn}->{masked} =~ s/\*/x/mg;
+        $f->{trn}->{ccpaid} = q{\\} . dollars($chg->amount_charged);
+        $f->{trn}->{apcode} = $chg->{chgApprovalCode};
+        $f->{trn}->{batch}  = $chg->{chgBatchNum};
+        $f->{trn}->{cctid}  = $chg->{chgTransactionID};
+        foreach my $k (sort keys %$layout) {
+            next unless $k =~ /^rctpage\.ccpaid\.\d+\.(\S+)$/;
+            my $obj  = lc $1;
+            my $vals = $layout->{$k};
+            die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+            draw_obj($htx, 0, 0, $obj, $vals);
+        }
+    }
+    foreach my $k (sort keys %$layout) {
+        next unless $k =~ /^rctpage\.change\.\d+\.(\S+)$/;
+        my $obj  = lc $1;
+        my $vals = $layout->{$k};
+        die "*** Duplicate definitions in layout for $k\n" if ref $vals;
+        draw_obj($htx, 0, 0, $obj, $vals);
+    }
+
+    emit_done;
+}
+
+# Field substitution
+sub fldsub {
+    my $htx = shift;
+    my $str = shift;
+    my $f   = $htx->{fields};
+
+    while ($str =~ m/(?<!\\)\$([\w\.]+)/) {
+        my $field = $1;
+        my ($a, $b) = split(/\./, $field, 2);
+        my $val;
+        if (defined $b) {
+            $val = exists $f->{$a}->{$b} ? $f->{$a}->{$b} : "?$field?";
+        }
+        else {
+            $val = exists $f->{$field} ? $f->{$field} : "?$field?";
+        }
+        $str =~ s/(?<!\\)\$[\w\.]+/$val/;
+    }
+    $str =~ s/\\-\$/-\$/mg;  # Change \-$ to -$
+    $str =~ s/\\\$/\$/mg;    # Change \$ to $
+    $str =~ s/\\\\/\\/mg;    # Change \\ to \
+    return $str;
+}
+
+# Convert units to points
+sub to_pts {
+    my $length = shift;
+    $length = $1 . ($2 / in) if $length =~ m/([+\-]?)([\d\.]+)in\s*$/;
+    $length = $1 . ($2 / cm) if $length =~ m/([+\-]?)([\d\.]+)cm\s*$/;
+    $length = $1 . ($2 / mm) if $length =~ m/([+\-]?)([\d\.]+)mm\s*$/;
+    $length = $1 . ($2 / pt) if $length =~ m/([+\-]?)([\d\.]+)pt\s*$/;
+    return $length;
+}
+
+# Text-relative position adjustment, if units begin with a + or a -
+sub to_rel {
+    my ($x, $y) = @_;
+    $x += $LX if $x =~ m/^[+\-]\d/;
+    $y += $LY if $y =~ m/^[+\-]\d/;
+    return ($x, $y);
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+htx-pdfout - Produce tickets and/or a receipt as a PDF file
+
+=head1 SYNOPSIS
+
+ htx-pdfout [options]
+
+ Options:
+  -c    --config-file   Alternate config file
+  -d    --delete-file   Delete file after mailing
+  -h    --help          Usage summary
+  -k    --tickets       Produce tickets
+  -l    --layout        Layout name
+  -m    --mailto        Email the PDF file to the given address(es)
+  -r    --receipt       Produce a receipt
+  -t    --trnid         Transaction ID - REQUIRED
+  -v    --verbose       Verbose output
+  -w    --webdb         Use database specified by web definitions
+  -o    --output-file   Specify PDF output file name
+
+=head1 DESCRIPTION
+
+This utility creates a PDF file that contains printable tickets and/or
+a receipt for the given transaction.  By default, both the tickets and the
+receipt page are included.
+
+The "web" layout is used unless overridden with --layout.
+
+The output filename is "htx-tix-$trnId-$trnPickupCode.pdf" in the current
+directory unless specified by the --output-file switch.
+
+Specifying only --receipt or --tickets produces just that; specify neither or 
+both switches produces both types of output.
+
+=head1 LAYOUT
+
+The ticket and receipt page layouts are described in the Hauntix configuration
+file.  The syntax is... TBS
+
+=cut
+

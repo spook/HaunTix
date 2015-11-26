@@ -1,0 +1,511 @@
+#!/usr/bin/perl -w
+use strict;
+use FindBin;
+use Config::Std;
+use DBI;
+use Fcntl qw/:DEFAULT :flock/;
+use Getopt::Long;
+use Pod::Usage;
+use POSIX qw(strftime);
+use Term::Emit qw/:all/;
+use Tk;
+use Tk::NumKeypad;
+use Tk::ROText;
+use utf8;
+
+use lib "$FindBin::RealBin/../lib";
+use htx;
+use htx::pop_error;
+use htx::pos_db;
+use htx::pos_style;
+use htx::scan;
+use htx::show;
+use htx::ticket;
+
+my @SCAN_QUEUE   = ();    # Scan queue contains scan items
+my $GTIME        = q{};
+my $GAP          = 30;
+my @TODAYS_SHOWS = ();
+
+my $opts = {};
+GetOptions($opts, "anyshow|a", "help|h", "config-file|c=s", "scanport|s=s", "verbose|v")
+    or pod2usage(2);
+pod2usage(1) if $opts->{help};
+
+# Globals & config
+my $htx = {};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+
+# Database setup
+connect_db($htx);
+
+# Setup and show the GUI
+layout_screen($htx);
+
+# Run alone
+run_alone();
+
+# Determine tonight's shows
+todays_shows($htx) unless $opts->{anyshow};
+
+# Start the watcher for input on the scanner port
+my $scanport = $opts->{scanport} || '/dev/ttyS1';
+$htx->{scanhandle} = undef;
+if (sysopen(SCANHANDLE, $scanport, O_NONBLOCK)) {
+    $htx->{scanport}   = $scanport;
+    $htx->{scanhandle} = \*SCANHANDLE;
+    $htx->{scan_tmr}   = $htx->{mw}->repeat(333, sub {check_scanport($htx);});
+}
+else {
+    htx::pop_error::show($htx, "Unable to open scanport $scanport:\n$!", -keep => 1, -exit => 2);
+}
+
+MainLoop;
+exit 0;
+
+####### O #######
+
+# Layout main screen
+sub layout_screen {
+    my $htx = shift;
+    my $mw = $htx->{mw} = MainWindow->new(-background => $COLOR_BG);
+
+    # Set us fullscreen
+    my $sh = $mw->screenheight;
+    my $sw = $mw->screenwidth;
+    $sh = 768  if $sh > 768;     # TEMP
+    $sw = 1024 if $sw > 1024;    # TEMP
+    $sh -= 50;                   # TEMP
+    $mw->geometry("${sw}x${sh}+0+0");
+    $mw->resizable(0, 0);        # Can't change size
+
+    #    $mw->overrideredirect(1);  # remove all window decorations
+    $mw->title("Hauntix Access Control");
+
+    $htx->{scan_queue_frame}
+        = $mw->Frame(-background => '#331111', -borderwidth => 3, -relief => 'groove')
+        ->form(-left => '%0', -right => '%69', -top => '%0', -bottom => '%100');
+    $htx->{manual_entry_frame}
+        = $mw->Frame(-background => '#113311', -borderwidth => 3, -relief => 'groove')
+        ->form(-left => '%70', -right => '%100', -top => '%0', -bottom => '%64');
+    $htx->{command_frame} = $mw->Frame(-borderwidth => 3, -relief => 'groove')
+        ->form(-left => '%70', -right => '%100', -top => '%65', -bottom => '%100');
+
+    layout_scan_queue($htx);
+    layout_manual_entry($htx);
+    layout_command($htx);
+
+    $htx->{tixno_entry}->focus;
+}
+
+sub layout_scan_queue {
+    my $htx = shift;
+    my $f   = $htx->{scan_queue_frame};
+
+    fill_scan_queue($htx);
+
+    # Start the timer to refresh the scan queue
+    $f->repeat(1000, sub {update_scan_queue($htx);});
+}
+
+sub fill_scan_queue {
+    my $htx = shift;
+    my $f   = $htx->{scan_queue_frame};
+
+    # Clear old items from the queue
+    my $now = time();
+    while (@SCAN_QUEUE) {
+        my $top = $SCAN_QUEUE[0];
+        last if (($now - $top->{scantime}) < 30);
+
+        # Old, remove it
+        shift @SCAN_QUEUE;
+    }
+
+    # Any scans to show?
+    if (!@SCAN_QUEUE) {
+        $f->Label(
+            -font => $FONT_LG,
+            -text => " Ready For Scans "
+        )->pack(-anchor => 'center', -expand => 1);
+        return;
+    }
+
+    # Show 'em...
+    foreach my $scan (@SCAN_QUEUE) {
+        $f->Label(
+            -font       => $FONT_LG,
+            -text       => "Ticket $scan->{tixno}: $scan->{status}",
+            -background => $scan->{state} ? '#33ff33' : '#ff3333',
+        )->pack();
+    }
+
+}
+
+sub update_scan_queue {
+    my $htx = shift;
+    my $f   = $htx->{scan_queue_frame};
+
+    # Delete existing items in the frame
+    foreach my $kid ($f->children()) {
+        $kid->destroy() if Tk::Exists $kid;
+    }
+
+    # Redraw it
+    return fill_scan_queue($htx);
+}
+
+sub layout_manual_entry {
+    my $htx = shift;
+    my $f   = $htx->{manual_entry_frame};
+
+    $f->Label(
+        -font => $FONT_MD,
+        -text => "Manual Ticket Number Entry"
+    )->pack();
+    my $e = $htx->{tixno_entry} = $f->Entry(
+        -font    => $FONT_XL,
+        -justify => 'center'
+    )->pack;
+    $e->bind("<KP_Enter>"   => sub {check_ticket($htx);});
+    $e->bind("<Key-Return>" => sub {check_ticket($htx);});
+    $e->bind("<Key-space>"  => sub {check_ticket($htx);});
+
+    $f->NumKeypad(-font => $FONT_XXL, 
+                  -entry => $e,
+                  -keysub => {'.' => "\x{21d0}"},
+                  -keyval => {'.' => 'BACKSPACE'},
+                 )->pack();
+    $f->Button(-font => $FONT_LG, -text => "Check Ticket", -command => sub {check_ticket($htx);})
+        ->pack();
+    $f->Button(-font => $FONT_LG, -text => "Add Trolls", -command => sub {add_sidein($htx);})
+        ->pack(-pady => 7);
+}
+
+sub layout_command {
+    my $htx = shift;
+    my $f   = $htx->{command_frame};
+
+    $htx->{clock_lbl} = $f->Label(
+        -text => "Loading...\n00:00:00",
+        -font => $FONT_BG
+    )->pack();
+    $htx->{clock_tmr} = $f->repeat(1000, sub {update_current_time($htx->{clock_lbl})});
+
+    # Time since last group
+    $htx->{gaptm_lbl} = $f->Label(
+        -text => "0",
+        -font => $FONT_XL
+    )->pack();
+    $htx->{gaptm_tmr} = $f->repeat(950, sub {update_gap_time($htx->{gaptm_lbl})});
+
+    # Input rate
+    $htx->{rate_lbl} = $f->Label(
+        -text => "0/hr",
+        -font => $FONT_XL
+    )->pack();
+    $htx->{rate_tmr} = $f->repeat(15000, sub {update_rate($htx->{rate_lbl})});
+
+    # Input ratio
+    $htx->{ratio_lbl} = $f->Label(
+        -text => "0 : 0 V:R",
+        -font => $FONT_XL
+    )->pack();
+    $htx->{ratio_tmr} = $f->repeat(15000, sub {update_ratio($htx->{ratio_lbl})});
+
+    $f->Button(
+        -text    => "Quit",
+        -font    => $FONT_MD,
+        -command => sub {exit 0},
+    )->pack(-side => 'bottom');
+
+}
+
+sub todays_shows {
+    emit "Loading today's shows";
+    my $htx = shift;
+    my $db  = $htx->{db};
+
+    my $sql
+        = "SELECT shoId,shoTime,shoSellUntil "
+        . "  FROM shows"
+        . " WHERE (shoTime - INTERVAL 3 HOUR) <= NOW()"
+        . "   AND (shoSellUntil + INTERVAL 3 HOUR) >= NOW();";
+    my $recs = $db->select($sql);
+    
+    htx::pop_error::show($htx, "Error selecting shows: " . $db->error(), -keep => 1, -exit => 3)
+        if $db->error();
+    htx::pop_error::show($htx, "There are no shows within 3 hours of now.  Exiting program.\n"
+                              ."Re-run with the --anyshow option if desired.", 
+                         -keep => 1, -exit => 4) 
+        if !@$recs && !$db->error();
+    @TODAYS_SHOWS = map {$_->{shoId}} @$recs;
+    emit_text "Today's shows: " . join(",", @TODAYS_SHOWS);
+}
+
+sub update_current_time {
+    my $lbl = shift;
+    $lbl->configure(-text => strftime("%a %d-%b-%Y\n%H:%M:%S %Z", localtime(time())));
+}
+
+sub update_gap_time {
+    my $lbl = shift;
+    my $t   = q{---};
+    $t = time() - $GTIME if $GTIME;
+    $lbl->configure(-text => $t . "s last G");
+}
+
+sub update_rate {
+    my $lbl = shift;
+    my $db  = $htx->{db};
+
+    my $sql
+        = "SELECT COUNT(*) as N"
+        . "  FROM scans"
+        . " WHERE scnResult IN ('Allowed','ForceAllow')"
+        . "   AND scnTimestamp > NOW() - INTERVAL 15 MINUTE";
+    my $recs = $db->select($sql);
+    exit emit_error {-reason => "Error selecting scans: " . $db->error()} if $db->error();
+    exit emit_error {-reason => "Not one count returned"} if @$recs != 1;
+    my $rate = $recs->[0]->{N}*4;
+    $lbl->configure(-text => "$rate/hr");
+
+}
+
+sub update_ratio {
+    my $lbl = shift;
+    my $r   = q{---};
+    $r = "1.7 : 1";    # Temp
+    $lbl->configure(-text => $r . " V:R");
+
+}
+
+# For entries where people are let-in with out a ticket.
+# We'll make a scan record for each, with a scnNumber of 0.
+sub add_sidein {
+    my $htx   = shift;
+    my $cfg   = $htx->{cfg};
+    my $e     = $htx->{tixno_entry};
+    my $count = int($e->get() || 0);
+    print "Adding side-in count $count\n"
+        if $opts->{verbose};
+    if ($count > 100 || $count <= 0) {
+
+        # More than 100?  that's not right!  Usually a half-dozen at a time.
+        $e->delete(0, 'end');
+        $e->insert(0, $count > 0 ? 'Too Many!' : 'How Many?!');
+        $e->after(4700, sub {$e->delete(0, 'end');});
+        system("aplay -q $cfg->{sound}->{acc_badcount} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_badcount};
+        return 0;
+    }
+
+    # Add the records
+    for (1 .. $count) {
+        my $scanrec = htx::scan->new(
+            -htx       => $htx,
+            -scnNumber => 0,
+            -scnStatus => "side-in",
+            -scnResult => "Allowed",
+        );
+        if ($scanrec->error()) {
+            htx::pop_error::show($htx, "Unable to create scan record: " . $scanrec->error());
+            last;
+        }
+        print "  scnId=" . $scanrec->{scnId} . "\n"
+            if $opts->{verbose};
+    }
+    system("aplay -q $cfg->{sound}->{acc_sidein} &")
+        if $cfg->{sound}->{enabled}
+            && -r $cfg->{sound}->{acc_sidein};
+
+    # Clear the entry for the next time
+    $e->delete(0, 'end');
+}
+
+sub check_ticket {
+    my $htx   = shift;
+    my $cfg   = $htx->{cfg};
+    my $e     = $htx->{tixno_entry};
+    my $tixno = $e->get();
+    print "Checking ticket $tixno\n"
+        if $opts->{verbose};
+
+    # TODO: check recent scans for dups
+    foreach my $sb (@SCAN_QUEUE) {
+        if (($tixno =~ m/^\d+$/) && ($sb->{tixno} == $tixno)) {
+
+            # Duplicate scan
+            $e->delete(0, 'end');
+            system("aplay -q $cfg->{sound}->{acc_dup} &")
+                if $cfg->{sound}->{enabled}
+                    && -r $cfg->{sound}->{acc_dup};
+            print "  Duplicate scan\n"
+                if $opts->{verbose};
+            return;
+        }
+    }
+
+    # create a scan blob
+    my $scanblob = {
+        tixno    => $tixno,
+        scantime => time(),
+        status   => 'Checking...',
+        state    => undef,          # undef, 0 or 1 - simple state to test  ### TODO: make constants
+        tix      => undef,          # Ticket object
+    };
+    push @SCAN_QUEUE, $scanblob;
+
+    # Look for the ticket
+    my ($tixId, $tixCode) = htx::ticket::untixno($tixno);
+    my $tix = $scanblob->{tix} = htx::ticket->load(-htx => $htx, -tixId => $tixId);
+    if ($tix->error) {
+        $scanblob->{status} = "No Such Ticket";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    elsif ($tix->{tixCode} != $tixCode) {
+        $scanblob->{status} = "Invalid Ticket";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    elsif (($tix->{tixState} eq $TIX_STATE_IDLE)
+        || ($tix->{tixState} eq $TIX_STATE_HELD))
+    {
+        $scanblob->{status} = "Ticket Not Yet Sold";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    elsif ($tix->{tixState} eq $TIX_STATE_VOID) {
+        $scanblob->{status} = "Ticket is VOID";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    elsif ($tix->{tixState} eq $TIX_STATE_SWAP) {
+        $scanblob->{status} = "Ticket was SWAPPED";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    elsif ($tix->{tixState} ne $TIX_STATE_SOLD) {
+        $scanblob->{status} = "Ticket Already Used";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    elsif (!$opts->{anyshow} && !grep {$_ == $tix->{shoId}} @TODAYS_SHOWS) {
+        $scanblob->{status} = "Wrong Day";
+        $scanblob->{state}  = 0;
+        system("aplay -q $cfg->{sound}->{acc_deny} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_deny};
+    }
+    else {
+
+        # Is OK
+        $scanblob->{status} = "Entry OK";
+        $scanblob->{state}  = 1;
+        system("aplay -q $cfg->{sound}->{acc_ok} &")
+            if $cfg->{sound}->{enabled}
+                && -r $cfg->{sound}->{acc_ok};
+    }
+    print "  State: $scanblob->{state}  Status: $scanblob->{status}\n"
+        if $opts->{verbose};
+    $GTIME = time()
+        if $scanblob->{state} && (!$GTIME || (time() - $GTIME) > $GAP);
+
+    # Create the scan record
+    my $scanrec = htx::scan->new(
+        -htx       => $htx,
+        -scnNumber => $tixno,
+        -scnStatus => $scanblob->{status},
+        -scnResult => $scanblob->{state} ? "Allowed" : "Denied",
+    );
+    if ($scanrec->error()) {
+        htx::pop_error::show($htx, "Unable to create scan record: " . $scanrec->error());
+        $e->delete(0, 'end');
+        return;
+    }
+    print "  scnId=" . $scanrec->{scnId} . "\n"
+        if $opts->{verbose};
+
+    # Mark the ticket as Used
+    if ($scanblob->{state}) {
+        $tix->{tixState} = $TIX_STATE_USED;
+        $tix->save;
+        if ($tix->error()) {
+            htx::pop_error::show($htx,"Error marking ticket as used: " . $tix->error());
+        }
+    }
+
+    # Clear the entry for the next time
+    $e->delete(0, 'end');
+}
+
+sub check_scanport {
+    my $htx      = shift;
+    my $scanport = $htx->{scanport};
+    my $h        = $htx->{scanhandle};
+
+    my $buf;
+    my $n = sysread($h, $buf, 100);
+    return if !defined($n);
+
+    chomp $buf;
+    my $tixno = int($buf || q{0}) || 0;
+    return if !$tixno;
+    print "Ticket number $tixno scanned on port $scanport\n"
+        if $opts->{verbose};
+
+    my $e = $htx->{tixno_entry};
+    $e->delete(0, 'end');
+    $e->insert(0, $tixno);
+
+    check_ticket($htx);
+}
+
+# Insure there's only one copy of us running on this system
+sub run_alone {
+    for (1..5) {
+        if (flock main::DATA, LOCK_EX | LOCK_NB) {
+            return;
+        }
+        sleep 1;
+    }
+    htx::pop_error::show($htx, "Another copy of ourselves is running.  Exiting this instance.\n",
+                         -exit => 5);
+}
+
+__END__
+
+=head1 NAME
+
+hauntix-acc - HaunTix Access Control (entry scanning) application
+
+=head1 SYNOPSIS
+
+ hauntix-acc [options]
+
+ Options:
+  -h    --help          Usage summary
+  -a    --anyshow       Allow any show (no show checking)
+  -c    --config-file   Alternate config file
+  -s    --scanport      Serial port for barcode scanner, default is /dev/ttyS1
+  -v    --verbose       Verbose output
+
+=head1 DESCRIPTION
+
+Used at access control stations to validate customer tickets.
+
+=cut

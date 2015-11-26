@@ -1,0 +1,68 @@
+#!/bin/bash
+set -o verbose
+
+# Practice Nite
+htx-mktix -s 31 -n 100
+htx-mktix -s 32 -n 100
+
+# Early Season
+htx-mktix -s 51 -n 1000
+htx-mktix -s 52 -n 1000
+
+# Full Season
+htx-mktix -s 71 -n 1000
+htx-mktix -s 72 -n 1000
+
+# Parade of Haunts
+htx-mktix -s 91 -n 750
+htx-mktix -s 92 -n 750
+
+# Individual days
+htx-mktix -s 101 -n  600
+htx-mktix -s 102 -n  600
+htx-mktix -s 103 -n  600
+htx-mktix -s 104 -n  600
+htx-mktix -s 105 -n  600
+htx-mktix -s 106 -n  600
+htx-mktix -s 107 -n  600
+htx-mktix -s 108 -n 1300
+htx-mktix -s 109 -n 1300
+htx-mktix -s 110 -n 1300
+htx-mktix -s 111 -n 1300
+htx-mktix -s 112 -n 1300
+htx-mktix -s 113 -n 1300
+htx-mktix -s 114 -n 1300
+htx-mktix -s 115 -n 1300
+htx-mktix -s 116 -n 1300
+htx-mktix -s 117 -n 1300
+htx-mktix -s 118 -n 1300
+htx-mktix -s 119 -n 1300
+htx-mktix -s 120 -n 1300
+htx-mktix -s 121 -n 1300
+htx-mktix -s 122 -n 1300
+htx-mktix -s 123 -n 1300
+
+htx-mktix -s 201 -n 300
+htx-mktix -s 202 -n 300
+htx-mktix -s 203 -n 300
+htx-mktix -s 204 -n 300
+htx-mktix -s 205 -n 300
+htx-mktix -s 206 -n 300
+htx-mktix -s 207 -n 300
+htx-mktix -s 208 -n 700
+htx-mktix -s 209 -n 700
+htx-mktix -s 210 -n 700
+htx-mktix -s 211 -n 700
+htx-mktix -s 212 -n 700
+htx-mktix -s 213 -n 700
+htx-mktix -s 214 -n 700
+htx-mktix -s 215 -n 700
+htx-mktix -s 216 -n 700
+htx-mktix -s 217 -n 700
+htx-mktix -s 218 -n 700
+htx-mktix -s 219 -n 700
+htx-mktix -s 220 -n 700
+htx-mktix -s 221 -n 700
+htx-mktix -s 222 -n 700
+htx-mktix -s 223 -n 700
+

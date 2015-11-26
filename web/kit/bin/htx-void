@@ -1,0 +1,225 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long qw(:config no_ignore_case);
+use htx;
+use htx::ticket;
+use htx::transaction;
+use Pod::Usage;
+use POSIX qw/strftime/;
+use Term::Emit qw/:all/;
+$| = 1;
+
+my $opts = {};
+#<<<
+GetOptions($opts, 
+           "all|a",
+           "config-file|c=s", 
+           "force|f",
+           "help|h",
+           "reason|r:s",
+           "simulate|s",
+           "ticket|t=i",
+           "transaction|T=i",
+           "verbose|v+",
+           "webdb|w",
+        ) or pod2usage(2);
+#>>>
+pod2usage(1) if $opts->{help};
+Term::Emit::setopts(
+    -maxdepth => $opts->{verbose} || 0,
+    -showseverity => $Term::Emit::SEVLEV{'NOTE'}
+);
+die "*** Transaction ID or ticket number required\n"
+    if !$opts->{transaction} && !$opts->{ticket};
+die "*** Supply either Transaction ID or ticket number, but not both\n"
+    if $opts->{transaction} && $opts->{ticket};
+
+my $trnId  = $opts->{transaction} || q{};
+my $tixno  = $opts->{ticket}      || q{};
+my $reason = $opts->{reason}      || '-- no reason --';
+my $tstamp = strftime("%d-%b-%Y %H:%M:%S %Z", localtime(time()));
+
+# Globals & config
+my $htx = {};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+
+# Database setup
+init_db($htx);
+my $db = $htx->{db};
+
+# Transaction from a ticket number?
+if ($opts->{ticket} && $opts->{all}) {
+    emit "Looking up transaction for this ticket";
+    my ($tixId, $tixCode) = htx::ticket::untixno($tixno);
+    my $sql
+        = "SELECT t.trnId, t.trnPhase "
+        . "  FROM transactions t, sales s, tickets x"
+        . " WHERE s.salId = x.salId"
+        . "   AND s.trnId = t.trnId"
+        . "   AND x.tixId ="   . $db->quote($tixId)
+        . "   AND x.tixCode =" . $db->quote($tixCode);
+    my $recs = $db->select($sql);
+    exit emit_fail {-reason => "Database error: " . $db->error()}     if $db->error();
+    exit emit_fail {-reason => "No such ticket $tixno"}               if !@$recs;
+    exit emit_fail {-reason => "Yikes! More than one ticket #$tixno"} if @$recs > 1;
+    exit emit_warn {-reason => "Transaction $trnId already voided"} 
+        if !$opts->{force} && $recs->[0]->{trnPhase} eq $TRN_PHASE_VYD;
+    $trnId = $recs->[0]->{trnId};
+    emit_done {-reason => "Transaction $trnId"};
+}
+
+# Lookup ticket if that's all that was given
+my $tixrecs = [];
+if ($opts->{ticket} && !$opts->{all}) {
+    emit "Looking up ticket";
+    my ($tixId, $tixCode) = htx::ticket::untixno($tixno);
+    my $sql
+        = "SELECT x.tixId, x.tixCode, x.tixState, x.tixNote "
+        . "  FROM tickets x"
+        . " WHERE x.tixId ="   . $db->quote($tixId)
+        . "   AND x.tixCode =" . $db->quote($tixCode);
+    $tixrecs = $db->select($sql);
+    exit emit_fail {-reason => "Database error: " . $db->error()}     if $db->error();
+    exit emit_fail {-reason => "No such ticket $tixno"}               if !@$tixrecs;
+    exit emit_fail {-reason => "Yikes! More than one ticket #$tixno"} if @$tixrecs > 1;
+    exit emit_warn {-reason => "Ticket $tixno already voided"} 
+        if !$opts->{force} && $tixrecs->[0]->{tixState} eq $TIX_STATE_VOID;
+}
+
+# Check if transaction exists
+my $trnNote  = q{};
+my $trnPhase = q{};
+if ($trnId) {
+    emit "Checking transaction";
+    my $sql
+        = "SELECT trnPhase, trnNote "
+        . "  FROM transactions"
+        . " WHERE trnId=" . $db->quote($trnId);
+    my $recs = $db->select($sql);
+    exit emit_fail {-reason => "Database error: " . $db->error()}          if $db->error();
+    exit emit_fail {-reason => "No such transaction $trnId"}               if !@$recs;
+    exit emit_fail {-reason => "Yikes! More than one transaction #$trnId"} if @$recs > 1;
+    exit emit_warn {-reason => "Transaction $trnId already voided"} 
+        if !$opts->{force} && $recs->[0]->{trnPhase} eq $TRN_PHASE_VYD;
+    emit_prog "(phase " . $recs->[0]->{trnPhase} . ")";
+    $trnNote  = $recs->[0]->{trnNote};
+    $trnPhase = $recs->[0]->{trnPhase};
+    emit_ok;
+
+    # Find tickets for this transaction
+    emit "Finding tickets for the transaction";
+    $sql
+        = "SELECT x.tixId, x.tixCode, x.tixState, x.tixNote "
+        . "  FROM tickets x, sales s"
+        . " WHERE x.salId = s.salId"
+        . "   AND s.trnId = " . $db->quote($trnId);
+    $tixrecs = $db->select($sql);
+    exit emit_fail {-reason => "Database error: " . $db->error()} if $db->error();
+    emit_prog scalar(@$tixrecs) . " tickets";
+    foreach my $tix (@$tixrecs) {
+        emit_text "Ticket $tix->{tixId}-$tix->{tixCode} ($tix->{tixState})";
+    }
+    emit_ok;
+}
+
+exit 0 if $opts->{simulate};
+
+# Void the transaction
+if ($trnId) {
+    emit "Voiding transaction";
+    if ($trnPhase ne $TRN_PHASE_VYD) {
+        $trnNote .= q{/} if $trnNote;
+        $trnNote .= substr($trnNote . "VOID by $ENV{USER} at $tstamp: $reason", 0, 255);
+        my $sql
+            = "UPDATE transactions"
+            . "   SET trnPhase=" . $db->quote($TRN_PHASE_VYD)
+            . "       ,trnNote=" . $db->quote($trnNote)
+            . " WHERE trnId="    . $db->quote($trnId);
+        $db->update($sql);
+        exit emit_fail {-reason => "Database error: " . $db->error()} if $db->error();
+        emit_done;
+    }
+    else {
+        emit_done "SKIP";
+    }
+}
+
+# Void tickets
+emit "Voiding " . scalar(@$tixrecs) . " ticket(s)";
+foreach my $tix (@$tixrecs) {
+    emit "Ticket #" . htx::ticket::mktixno($tix->{tixId}, $tix->{tixCode});
+    if ($tix->{tixState} eq $TIX_STATE_VOID) {
+        emit_done "SKIP";
+        next;
+    }
+    my $tixNote = $tix->{tixNote} || q{};
+    $tixNote .= q{/} if $tixNote;
+    $tixNote .= substr($tixNote . "VOID by $ENV{USER} at $tstamp: $reason", 0, 255);
+
+    my $sql
+        = "UPDATE tickets "
+        . "   SET tixState=" . $db->quote($TIX_STATE_VOID)
+        . "      ,tixNote="  . $db->quote($tixNote)
+        . " WHERE tixId="    . $db->quote($tix->{tixId});
+    $db->update($sql);
+    exit emit_fail {-reason => "Database error: " . $db->error()} if $db->error();
+    emit_done;
+}
+emit_done;
+
+exit 0;
+
+# Initialize the database
+sub init_db {
+    my $htx   = shift;
+    my $opts  = $htx->{opts};
+    my $dbloc = $opts->{webdb} ? $htx->{cfg}->{dbweb} : $htx->{cfg}->{db};
+    emit "Connecting to database at $dbloc->{host}" if $opts->{verbose};
+    my $db = $htx->{db} = new htx::db;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->connect($dbloc);
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->setup;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    return emit_ok;
+}
+
+__END__
+
+=head1 NAME
+
+htx-void - Void a HaunTix Transaction or Ticket
+
+=head1 SYNOPSIS
+
+ htx-void [options]
+
+ Options:
+  -a    --all           Void all the transaction & tickets based on just a ticket number
+  -c    --config-file   Alternate config file
+  -f    --force         Force void even if already voided
+  -h    --help          Usage summary
+  -r    --reason        Reason for doing the void
+  -s    --simulate      Simulate action, do not really void it
+  -t    --ticket        Ticket number - transaction or ticket required
+  -T    --transaction   Transaction ID number - transaction or ticket required
+  -w    --webdb         Use database specified by web definitions
+  -v    --verbose       Verbose output; silent otherwise
+
+=head1 DESCRIPTION
+
+Voids a transaction or tickets.  Supply either -t or -T.
+
+Use --transaction (-T) to void the whole transaction and all it's tickets.
+Use --ticket (-t) to void just that ticket.
+Use --all (-a) with -t to do a whole transaction from just the ticket number;
+it looks up the transaction from that ticket number and acts 
+as if --transaction was used instead.
+
+=cut

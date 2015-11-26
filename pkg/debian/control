@@ -1,0 +1,26 @@
+Source:  	hauntix
+Section: 	office
+Priority: 	optional
+Maintainer: 	Steve Roscio [steve@HauntedMines.org]
+Homepage: 	http://HauntedMines.org
+Build-Depends: 	debhelper (>= 5)
+Standards-Version: 3.7.2
+
+Package: 	hauntix
+Architecture: 	all
+Essential: 	no
+Depends: 	libtk-perl, 
+ libcrypt-ssleay-perl, 
+ libconfig-std-perl,
+ libdbi-perl, 
+ libdbd-mysql-perl
+Pre-Depends: perl, mysql-server, mysql-client
+Recommends: libterm-emit-perl
+Provides: hauntix
+Description: Ticketing system for the Haunted Attraction industry.
+ .
+ Point-of-sale, web, and kiosk ticketing system
+ for the Haunted Attraction industry, and other
+ events that sell tickets and merchandise!
+ Also includes an access control module for scanning at
+ event entry points.

@@ -1,0 +1,232 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html lang="en-US" xml:lang="en-US" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<title>Haunted Mines Tickets</title>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <link type="text/css" rel="stylesheet" href="css/reset.css">
+  <link type="text/css" rel="stylesheet" href="css/jquery.validationEngine.css">
+  <link type="text/css" rel="stylesheet" href="css/htx/jquery-ui-1.8.22.custom.css">
+  <link type="text/css" rel="stylesheet" href="css/htxTix.css">
+  <script type="text/javascript" src="js/jquery-1.7.2.min.js"></script>
+  <script type="text/javascript" src="js/jquery.jstepper.min.js"></script>
+  <script type="text/javascript" src="js/jquery.validationEngine.js"></script>
+  <script type="text/javascript" src="js/jquery.validationEngine-en.js"></script>
+  <script type="text/javascript" src="js/jquery-ui-1.8.22.custom.min.js"></script>
+  <script type="text/javascript" src="js/htxTix.js"></script>
+</head>
+
+<body>
+  <!--[if IE]>
+   <center>
+    <a href="http://HauntedMines.org" alt="Haunted Mines Haunted House in Colorado Springs - Home">
+     <img src="img/hmTitleText.gif" border="0" alt="Haunted Mines"/>
+    </a>
+   </center>
+  <![endif]-->
+  <![if !IE]>
+   <center>
+    <a href="http://HauntedMines.org" alt="Haunted Mines Haunted House in Colorado Springs - Home">
+     <img src="img/hmTitleText.png" border="0" alt="Haunted Mines"/>
+    </a>
+   </center>
+  <![endif]>
+
+  <h1>Purchase Tickets</h1>
+  <p> Tickets may be purchased here online and printed on your own printer. &nbsp;
+    Tickets will also be emailed to you in PDF format, so you may print them later. &nbsp;
+    Choose the day, enter the number of tickets you want to purchase, verify your order, 
+    then enter your payment information (debit or credit card). </p>
+
+    <div title="About VIP Tickets" id="whatisVIP">
+	VIP ticket holders are admitted to the haunt at a faster rate than Regular ticket holders.
+	These tickets cost a bit more but are a good choice if you
+	want to impress your date, or just can't wait to be scared!
+    </div>
+    <div title="About Regular Tickets" id="whatisREG">
+	Regular Tickets let you experience the whole haunt,
+	but you may need to wait to let VIP ticket holders go in ahead of you.
+	These tickets are your best value.
+    </div>
+    <div title="About Service Charges" id="whatisServiceCharge">
+	The service charge covers the additional cost of processing
+	credit/debit cards online that is charged to us by the financial gateway.
+    </div>
+
+    <form method="post" action="htxTix.cgi" enctype="multipart/form-data" id="htxForm">
+
+    <h2>Step 1: Select Day</h2>
+    <div class="ctext">Click the day you want to attend the Haunted Mines.</div>
+    <div id="datepick"></div>
+    <div class="legend">
+      <span class="box_open">&#9633;</span> Available   &nbsp;
+      <span class="box_near">&#9633;</span> Selling out &nbsp;
+      <span class="box_full">&#9633;</span> Sold Out    &nbsp;
+      <span class="box_shut">&#9633;</span> Closed      &nbsp;
+    </div>
+    <input type="hidden" name="shoDate"    id="shoDate"    value=""/>
+    <input type="hidden" name="shoIdREG"   id="shoIdREG"   value="0"/>
+    <input type="hidden" name="shoIdVIP"   id="shoIdVIP"   value="0"/>
+
+
+    <h2>Step 2: Enter Number of Tickets</h2>
+      <div id="ntix" class="ui-helper-reset ui-widget-content ui-corner-all">
+		<table id="ntixtable">
+          <tr>
+            <td>Date</td>
+            <td colspan="2"><span id="datewant"><font color="red">-- Select Day Above --</font></span></td>
+          </tr>
+          <tr>
+            <td><span id="shoNameREG">Regular Ticket</span> 
+                <a href="#" class="explain" id="explainREG">&#9432;</a> </td>
+            <td><span id="priceREG">$--.--</span> each</td>
+            <td width="13%"><input id="ntixREG" value="0" size="2" maxlength="3" onkeyup="onlydigits(this);"/></td>
+          </tr>
+          <tr>
+            <td><span id="shoNameVIP">VIP Ticket</span>
+                <a href="#"  class="explain" id="explainVIP">&#9432;</a> </td>
+            <td><span id="priceVIP">$--.--</span> each</td>
+            <td width="13%"><input id="ntixVIP" value="0" size="2" maxlength="3" onkeyup="onlydigits(this);"/></td>
+          </tr>
+        </table>
+      </div>
+
+
+    <h2>Step 3: Verify Your Order</h2>
+      <div id="order" class="ui-helper-reset ui-widget-content ui-corner-all">
+		<table id="orertable">
+			<thead>
+				<tr id="orderhead">
+					<th width="10%">Quantity</th>
+					<th>Ticket and Show</th>
+					<th width="13%">Cost Each</th>
+					<th width="15%">Line Total</th>
+				</tr>
+			</thead>
+			<tbody id="orderbody">
+				<tr>
+					<td align="center" colspan="4"><br/>-- No Tickets Selected Yet --<br/>&nbsp;</td>
+				</tr>
+			</tbody>
+            <tfoot id="orderfoot">
+		  	  <tr>
+				<td align="right" colspan="3">Subtotal: </td>
+				<td width="15%" align="right" id="ordersubtotal">$0.00</td>
+			  </tr>
+	      	  <tr>
+				<td align="right" colspan="3">Tax: </td>
+				<td width="15%" align="right" id="ordertax">$0.00</td>
+			  </tr>
+			  <tr>
+				<td align="right" colspan="3">
+                    <a href="#" class="explain" id="explainServiceCharge">&#9432;</a>
+                    Service Charge:</td>
+				<td width="15%" align="right" id="ordercharge">$0.00</td>
+			  </tr>
+			  <tr>
+				<td align="right" colspan="3">Total: </td>
+				<td width="15%" align="right" id="ordertotal">$0.00</td>
+			  </tr>
+            </tfoot>
+		</table>
+      </div>
+
+
+    <h2>Step 4: Enter Payment Information</h2>
+      <div id="pay" class="ui-helper-reset ui-widget-content ui-corner-all">
+        <table id="paytable">
+	      <tr>
+		    <td>Name on Card</td>
+		    <td><input type="text" id="nameoncard" name="nameoncard"
+                   size="32" maxlength="80"
+                   class="payinfo validate[required]" /></td>
+	      </tr>
+	      <tr>
+		    <td>Your Email</td>
+		    <td><input type="text"  id="email" name="email"
+                   size="40" maxlength="127"
+                   class="payinfo validate[required,custom[email]]" />
+	      </tr>
+	      <tr>
+		    <td>Repeat Email</td>
+		    <td><input type="text" id="emailcheck" name="emailcheck"
+                   size="40" maxlength="127" 
+                   class="payinfo validate[required,equals[email]]" /></td>
+	      </tr>
+	      <tr>
+		    <td>Billing ZIP Code</td>
+		    <td><input type="text" id="zip" name="zip"
+                   size="9" maxlength="14"
+                   class="payinfo validate[required,custom[onlyNumberSp]]" /></td>
+	      </tr>
+	      <tr>
+		    <td>Credit Card Number</td>
+		    <td><input type="text" id="acctnum" name="acctnum"
+                   size="24" maxlength="24"
+                   class="payinfo validate[required,custom[creditcard]]" />
+                   (MC, Visa, Discover only)</td>
+	      </tr>
+	      <tr>
+		    <td>Expiration Date</td>
+		    <td><span>
+			    <select name="expm">
+			        <option selected="selected" value="0">month</option>
+			        <option value="01">01 - January</option>
+			        <option value="02">02 - February</option>
+			        <option value="03">03 - March</option>
+			        <option value="04">04 - April</option>
+			        <option value="05">05 - May</option>
+			        <option value="06">06 - June</option>
+			        <option value="07">07 - July</option>
+			        <option value="08">08 - August</option>
+			        <option value="09">09 - September</option>
+			        <option value="10">10 - October!</option>
+			        <option value="11">11 - November</option>
+			        <option value="12">12 - December</option>
+			    </select>
+                <select name="expy">
+			        <option selected="selected" value="0">year</option>
+			        <option value="12">2012</option>
+			        <option value="13">2013</option>
+			        <option value="14">2014</option>
+			        <option value="15">2015</option>
+			        <option value="16">2016</option>
+			        <option value="17">2017</option>
+			        <option value="18">2018</option>
+			        <option value="19">2019</option>
+			        <option value="20">2020</option>
+			        <option value="21">2021</option>
+			    </select>
+		    </span></td>
+	      </tr>
+	      <tr>
+		    <td>Security Code on Back</td>
+		    <td><input type="text" id="cardcode" name="cardcode"
+                   size="7" maxlength="7"
+                   class="payinfo validate[required,custom[onlyNumberSp]]" /></td>
+	      </tr>
+        </table>
+      </div>
+
+    <h3>Others are purchasing tickets right now, 
+        and may get these tickets before you do. &nbsp;  Act fast!</h3>
+
+    <div id="submits">
+     <input type="submit" name="do_purchase" value=" Buy Tickets "  style="float:left" id="buytix" />
+     <input type="submit" name="cancel"      value=" Cancel Order " style="float:right"
+         onclick="$(&quot;#tixForm&quot;).validationEngine(&quot;detach&quot;);" id="cancel" />
+    </div>
+
+    <input type="hidden" name="seqId" value="1344010828"/>
+    <input type="hidden" name="sig"   value="5wAI2E65I2XEkkFo2EjYpg"/>
+    <input type="hidden" name="step"  value="tix"/>
+
+    </form>
+
+    <p class="ctext small">
+	 For ticketing assistance, please email 
+        Tickets<img src="img/at.bmp" border="0" width="9px"/>HauntedMines.org
+    </p>
+
+    <div id="debug"></div>
+</body>
+</html>

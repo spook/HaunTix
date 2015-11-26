@@ -1,0 +1,25 @@
+README file for Hauntix
+
+After installing the package for the first time, 
+you must create the initial database schema.
+
+NOTE: This will *** WIPE OUT *** (erase, destroy, delete, nuke ) any 
+existing "hauntix" database you may have.  You have been warned.
+
+  # cd /usr/share/htx
+  # mysql -u root -p -f < hauntix_create.sql 
+
+When prompted, enter the database's root user password (not necessarily
+the same as the system's root password.  The first time you do this, 
+it's normal to get errors about can't drop a database and can't drop a user.
+
+Now from the same directory, load in some test data:
+
+  # mysql -u root -p -f < hauntix_test_data.sql 
+
+Again when prompted, enter the database's root user password.
+
+
+NEXT STEPS: Define your event, shows, tickets, etc.
+
+Happy Haunting!

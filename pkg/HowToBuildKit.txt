@@ -1,0 +1,20 @@
+Remember to edit debian/changelog to update the kit version.
+
+From the hauntix/pkg directory, do this:
+
+  # reset; dh clean; dpkg-buildpackage -b
+
+The kit will be deposited in the directory above pkg/.
+To install/upgrade:
+
+  # sudo dpkg -i ../hauntix_0.8_all.deb
+
+Or, combine and also filter thos stupid "levels before 5" warnings:
+
+  # reset; dh clean; dpkg-buildpackage -b 2>&1|grep -v 'levels before 5'; sudo dpkg -i ../hauntix_0.9_all.deb
+
+To reset and load database
+--------------------------
+mysql -u root --pass=whatever < usr/share/htx/hauntix_create.sql 
+mysql -u root --pass=whatever < usr/share/htx/hauntix_hm2013_data.sql 
+

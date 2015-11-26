@@ -1,0 +1,77 @@
+hauntix (0.9) unstable; urgency=low
+
+  * Updated SQL create script to handle initial condition of no hauntix user.
+  * 2014 season updates
+
+ -- Steve Roscio <steve@HauntedMines.org>  Tue, 16 Sep 2014 12:13:17 -0600
+
+hauntix (0.8) unstable; urgency=low
+
+  * shoSellUntil changed to absolute timestamp.
+  * pos.warn_amount threshold; gives warning if ordering above this.
+
+ -- Steve Roscio <steve@HauntedMines.org>  Tue, 28 May 2013 12:13:17 -0600
+
+hauntix (0.7) unstable; urgency=low
+
+  * Daily ticketing feature added.
+  * Added feature to not print receipts for cash-only sales.
+  * Added feature: reprint last receipt.
+  * Added feature: reprint last tickets.
+  * Added Transaction lookup feature, with reprint receipt/tickets subfunctions.
+  * Transaction & ticket void CLI utility added.
+  * Improved ticket & transaction void function on POS.
+  * Entry control keypad - backspace key added (requires Tk::NumKeypad 1.4+).
+  * Daily web tickets time removed; just date shown now.
+  * Only allow one copy of ourselves to run on a system (run_alone).
+  * More relevant stats reported in info panel.
+  * Show pickup code for last transaction in info panel.
+  * Make info panel update on newsale, in addition to every 15 seconds.
+  * Added badge check/use function.
+
+ -- Steve Roscio <steve@HauntedMines.org>  Wed, 13 Oct 2012 15:02:17 -0600
+
+hauntix (0.6) unstable; urgency=low
+
+  * Significant changes for on-line (web) ticket ordering and pickup code
+    support.
+
+ -- Steve Roscio <steve@HauntedMines.org>  Mon, 01 Oct 2011 13:13:13 -0600
+
+hauntix (0.5) unstable; urgency=low
+
+  * Common modules updated for web subsystem.
+
+ -- Steve Roscio <steve@HauntedMines.org>  Mon, 19 Aug 2010 16:17:19 -0600
+
+hauntix (0.4) unstable; urgency=low
+
+  * Changing to pre-loaded ticket model, from create-on-demand model.
+  * Timed-ticketing working well now.
+  * Some restructuring for web-site subsystem.
+
+ -- Steve Roscio <steve@HauntedMines.org>  Mon, 09 Aug 2010 17:52:47 -0600
+
+hauntix (0.3) unstable; urgency=low
+
+  * Started timed ticket structure
+  * Added sale item select & delete
+  * Support for multiple cc charges per transaction
+  * Support for datamax ticket printers
+  * Numerous little improvements
+
+ -- Steve Roscio <steve@HauntedMines.org>  Thu, 01 Jul 2010 13:35:14 -0600
+
+hauntix (0.2) unstable; urgency=low
+
+  * First working debian kit.
+  * Started timed ticket structure
+
+ -- Steve Roscio <steve@HauntedMines.org>  Sun, 14 Jun 2010 13:03:13 -0600
+
+hauntix (0.1) unstable; urgency=low
+
+  * Development version, waaaay to early for release.
+    Testing UI concepts, and such.
+
+ -- Steve Roscio <steve@HauntedMines.org>  Sun, 14 Feb 2010 20:58:38 -0700

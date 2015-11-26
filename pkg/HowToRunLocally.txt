@@ -1,0 +1,4 @@
+From this hauntix/pkg directory:
+
+   perl -Iusr/share/perl5 usr/bin/hauntix-pos
+

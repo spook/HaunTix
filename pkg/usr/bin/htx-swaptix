@@ -1,0 +1,550 @@
+#!/usr/bin/perl -w
+#
+# Command-line interface to generate and load tickets
+#
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long;
+use Pod::Usage;
+use Term::Emit qw/:all/;
+use Time::HiRes qw/gettimeofday tv_interval/;
+use htx;
+use htx::cc;
+use htx::show;
+use htx::ticket;
+use htx::transaction;
+
+use constant DEFAULT_DEADLINE => 24;    # hours
+
+#<<<
+my $opts = {};
+GetOptions($opts, 
+           "help|h",
+           "config-file|c=s",
+
+           "pickup-code|k=s",
+           "tickets|n=s@",
+           "email|m=s",
+           "show|s=i",
+           "verbose|v+",
+           "webdb|w",
+           "force|f",
+           "deadline|d=i",
+           "any|y",
+           "test|z",
+
+           "account-number|a=s",
+           "ccv2|back-code|b=s",
+           "expires|e=s",
+           "track|t=s",
+)
+    or pod2usage(2);
+pod2usage(1) if $opts->{help};
+#>>>
+# Check options
+Term::Emit::setopts(
+    -maxdepth => $opts->{verbose} || 0,
+    -showseverity => $Term::Emit::SEVLEV{'WARN'}
+);
+emit "Checking options";
+my $deadline = int($opts->{deadline} || DEFAULT_DEADLINE);
+exit emit_fail {-reason => "A positive number of hours is required for --deadline"}
+    if $deadline <= 0;
+my $email = $opts->{email};
+exit emit_fail {-reason => "An --email address is required"} if !$email;
+### Pool not an option!!!  derive from -w?  Note, $pool is used below
+my $pool = $opts->{pool} || $TIX_POOL_BOOTH;
+exit emit_fail {-reason => "The option --pool must be '$TIX_POOL_BOOTH' or '$TIX_POOL_WEB'"}
+    if ($pool ne $TIX_POOL_BOOTH) && ($pool ne $TIX_POOL_WEB);
+my $shonum = int($opts->{show} || 0);
+exit emit_fail {-reason => "A valid --showid is required\n"} if $shonum <= 0;
+emit_ok;
+
+# Globals & config
+emit "Loading configuration";
+my $htx = {opts => $opts};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+my $cfg = $htx->{cfg};
+emit_ok;
+
+# Database setup
+init_db($htx);
+
+# Does this show exist?
+emit "Checking show #$shonum";
+my $newshow = htx::show->load(-htx => $htx, -shoId => $shonum);
+exit emit_fail {reason => "New show does not exist or can't load:\n" . $newshow->error}
+    if $newshow->error;
+emit_ok;
+
+# Get list of tickets, from pickup code or as specified with list of tickets
+my @badtix = ();
+my @tixs   = ();
+emit "Making ticket list";
+if ($opts->{tickets}) {
+    emit "Checking provided ticket numbers";
+    my @tlist = sort split(/\s*,\s*/, join(',', @{$opts->{tickets}}));
+    foreach my $tixno (@tlist) {
+
+        # split tixno into tixid and tixcode
+        my ($tixId, $tixCode) = htx::ticket::untixno($tixno);
+        if (!$tixId || !$tixCode) {
+            emit_text "Ticket number format error";
+            push @badtix, $tixno;
+            next;
+        }
+        my $tix = htx::ticket->load(htx => $htx, tixId => $tixId);
+        if ($tix->error()) {
+            emit_text "Ticket error: " . $tix->error();
+            push @badtix, $tixno;
+            next;
+        }
+
+        # Check tixcode
+        if ($tix->{tixCode} != $tixCode) {
+            push @badtix, $tixno;
+            next;
+        }
+
+        # it exists
+        push @tixs, $tix;
+    }
+    exit emit_fail {-reason => "Bad ticket numbers: " . join(',', @badtix)} if @badtix;
+    emit_ok;
+}
+
+if ($opts->{'pickup-code'}) {
+    emit "Checking transaction from pickup code";
+    my $pikCode = $opts->{'pickup-code'};
+    my ($trnId, $trnPickupCode) = unpickup($pikCode);
+    exit emit_fail {-reason => "Bad pickup code format"} if !$trnId || !defined($trnPickupCode);
+    $pikCode = sprintf '%d-%5.5d', $trnId, $trnPickupCode;    # make it pretty for recording
+
+    my $trn = htx::transaction->load(-htx => $htx, -trnId => $trnId);
+    record_pickup($htx, $pikCode, $email, "Swap: Transaction error: " . $trn->error)
+        && exit emit_fail {-reason => "Transaction error: " . $trn->error}
+        if $trn->error;
+    record_pickup($htx, $pikCode, $email, "Swap: Pickup codes do not match")
+        && exit emit_fail {-reason => "Pickup codes do not match"}
+        if $trnPickupCode != $trn->{trnPickupCode};
+    record_pickup($htx, $pikCode, $email, "Swap: Transaction not final: " . $trn->phase())
+        && exit emit_fail {-reason => "Transaction not final: " . $trn->phase()}
+        if $trn->phase() ne $TRN_PHASE_FIN;
+    record_pickup($htx, $pikCode, $email, "Swap: Lookup OK");
+
+    # It's good, get the tickets from it
+    push @tixs, @{$trn->{tickets}};
+    emit_ok;
+}
+exit emit_fail {-reason => "No tickets found"} if !@tixs;
+emit_ok;
+
+# Check state of existing tickets
+emit "Checking " . scalar(@tixs) . " ticket states";
+my $badtix = 0;
+foreach my $tix (@tixs) {
+    next if $tix->{tixState} eq $TIX_STATE_SOLD;    # It's OK
+    ++$badtix;
+    emit_text "Ticket #" . $tix->tixno() . " is not exchangable: state=" . $tix->{tixState};
+}
+exit emit_fail {-reason => "Tickets in bad state"} if $badtix;
+emit_ok;
+
+# Check deadline of existing tickets (and tally the old cost as we go)
+# Note: it's the value of the tickets, not what they paid...
+my $oldcost  = 0;
+my $deadtime = isotime(time() + $deadline * 60 * 60);
+emit "Checking deadline ($deadtime)";
+$badtix = 0;
+foreach my $tix (@tixs) {
+    my $oldshow = htx::show->load(-htx => $htx, -shoId => $tix->{shoId});
+    exit emit_error {-reason => "Unable to find show associated with ticket "
+            . $tix->tixno() . ": "
+            . $oldshow->error()
+        }
+        if $oldshow->error();
+    $oldcost += $oldshow->{shoCost};
+
+    # Is showdate after deadline?
+    my $tixtime = $oldshow->{shoTime};
+    next if $tixtime gt $deadtime;    # Deadline ok
+    ++$badtix;
+    emit_text "Ticket #" . $tix->tixno() . " for " . $tixtime . " is past exchange deadline";
+}
+exit emit_fail {-reason => "Some tickets past deadline"} if $badtix && !$opts->{force};
+emit_text "Some tickets past deadline, but forced to allow this" if $badtix;
+emit_ok;
+
+# Process up-charge, if any
+emit "Calculating upcharge";
+my $ntix     = @tixs;
+my $newcost  = $ntix * $newshow->{shoCost};
+my $upcharge = $newcost > $oldcost ? $newcost - $oldcost : 0;
+emit_ok;
+emit_text "Upcharge: ".dol($upcharge)." (old: ".dol($oldcost).", new: ".dol($newcost).")";
+
+my $sc = 0;
+if ($upcharge) {
+    emit "Computing service charge";
+    my $percent = $cfg->{ccw}->{ServiceChargePercent} || 0;
+    my $persale = cent($cfg->{ccw}->{ServiceChargePerSale}   || 0);
+    my $roundup = cent($cfg->{ccw}->{ServiceChargeRoundUpTo} || 0);
+    $sc      = $persale + int($upcharge * $percent / 100.0);
+    $sc = int(($sc + $roundup - 1) / $roundup) * $roundup if $roundup;
+    emit_prog "sc=".dol($sc);
+}
+emit_text "Total charge: ".dol($upcharge+$sc);
+
+# --- Swap is OK at this point ---
+emit_text "Swap is allowed";
+if ($opts->{test}) {
+    emit "Test-swap only, exiting";
+    exit 0;
+}
+
+# Release any expired holds, so we start fresh
+emit "Releasing any expired ticket holds";
+    my $relerr = htx::ticket::release_expired_holds($htx);
+    exit emit_error {-reason => $relerr} if $relerr;
+emit_done;
+
+# Create Transaction
+emit "Creating new transaction";
+my $trn = htx::transaction->new(
+    -htx           => $htx,
+    -trnUser       => "web",
+    -trmMOD        => "auto",
+    -trnRemoteAddr => $ENV{REMOTE_ADDR} || "--n/a--",
+    -trnEmail      => $opts->{email} || "--n/a--",
+    -trnStation    => $opts->{webdb} ? 
+                uc($cfg->{web}->{station_id} || $htx::transaction::TRN_STATIONS_WEB[0])
+            : $cfg->{pos}->{station_id} || 0,
+);
+exit emit_fail {-reason => "Unable to create transaction: " . $trn->error()}
+    if $trn->error();
+emit_prog "tid=".$trn->trnid();
+emit_done;
+
+# Attempt to reserve new tickets for new show
+emit "Reserving tickets in new show";
+my $item = {
+    trnId        => $trn->{trnId},
+    show         => $newshow,
+    itmType      => "prd",                                            ### TODO: Use constant
+    itmName      => $newshow->{shoName},                              ### TODO: what about shoClass?
+    itmCost      => $newshow->{shoCost},
+    itmPaid      => 0,
+    itmIsTaxable => 0,
+    itmIsTicket  => 1,
+    itmIsTimed   => $newshow->{shoIsTimed},
+    itmIsDaily   => $newshow->{shoIsDaily},
+    tixPool      => $opts->{webdb} ? $TIX_POOL_WEB : $TIX_POOL_BOOTH,
+};
+$trn->add_item($item, $ntix);
+
+if ($trn->error) {
+    my $t1err = $trn->error;
+    $trn->cancel;
+    my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+    if ($t1err =~ m/Unable to get the (\d+) requested tickets; (\d+) available/i) {
+
+        # Not enough tickets!  Sold out.
+        my $nwant  = $1;
+        my $navail = $2;
+        my $reason
+            = ($navail == 0)
+            ? "Show #$newshow->{shoId} is SOLD OUT"
+            : "Show #$newshow->{shoId} does not have enough tickets ($navail available)";
+        exit emit_fail {-reason => $reason};
+    }
+
+    exit emit_fail {-reason => "Could not add tickets to the transaction:\n$t1err, $t0err"};
+}
+
+emit_done;
+
+emit "Applying ticket exchange credit";
+my $credit = $newcost > $oldcost ? $oldcost : $newcost;
+$item = {
+    trnId        => $trn->{trnId},
+    show         => undef,
+    itmType      => "dsc",               ### TODO: Use constant
+    itmName      => "Exchange Credit",
+    itmCost      => -$credit,
+    itmPaid      => 0,
+    itmMethod    => "FixedAmount",
+    itmIsTaxable => 0,
+    itmIsTicket  => 0,
+    itmIsTimed   => 0,
+    tixPool      => undef,
+};
+$trn->add_item($item, 1);
+if ($trn->error) {
+    my $t1err = $trn->error;
+    $trn->cancel;
+    my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+    exit emit_fail {-reason => "Error applying exchange credit to the transaction: $t1err, $t0err"};
+}
+emit_done;
+
+# Sanity check - our upcharge calculation should match transaction's owed amount
+emit "Checking transaction balance against upcharge";
+exit emit_error {-reason => "Yikes! The transaction balance "
+        . $trn->owed()
+        . " does not agree with the credit amount $credit nor the upcharge amount $upcharge"
+    }
+    if $trn->owed() != $upcharge;
+emit_done;
+
+# Process up-charge, if any
+if ($upcharge) {
+
+    # Compute service charge
+    emit "Applying service charge";
+    $trn->servicecharge($sc);
+    emit_prog dol($sc);
+    $trn->retally();
+    emit_done;
+
+    emit "Processing upcharge";
+
+    my $a = $opts->{'account-number'} || q{};
+    my $c = $opts->{ccv2}             || q{};
+    my $e = $opts->{expires}          || q{};
+    my $t = $opts->{track}            || q{};
+    $a =~ s/[^\d]//mg;     # only digits
+    $c =~ s/[^\d]//mg;     # only digits
+    $e =~ s/[^\d]//mg;     # only digits
+    $t =~ s/[^\w]//img;    # only word chars  ###TODO: Verify valid set, for shell protection!
+    exit emit_error {-reason => "Missing valid account number, ccv code, and/or expiration date"}
+        if !$a || !$c || !$e;
+    my $dol = sprintf "%4.2f\n", $upcharge / 100;
+    my $remaddr = $ENV{REMOTE_ADDR}||q{-local-};
+
+    my $crg = new htx::charge(htx => $htx);
+    $crg->trnid($trn->trnid);
+    $crg->comment("Ticket Exchange $remaddr");
+    $crg->amount_requested($trn->owed);
+    $crg->dup_mode(1);
+    $crg->acct($a);
+    $crg->ccv($c);
+    $crg->expdate($e);
+
+    emit "Submitting charge of " . dol($trn->owed);
+    my %ccdat = (
+        AcctNum         => $a,
+        CardCode        => $c,
+        ExpDate         => $e,
+        CheckDups       => $opts->{'duplicate-check'},
+        Amount          => dol($trn->owed),
+        ECI             => 7,
+        Address         => substr("Web Sale $remaddr", 0, 50),    ### TODO: Ask for this??
+        ZipCode         => q{00000},  ### where to get this?
+        CustomerPresent => "FALSE",
+        CardPresent     => "FALSE",
+        UseWeb          => $opts->{webdb} ? 1 : 0,
+    );
+    my $rsp = htx::cc::charge($htx, %ccdat);
+    emit_done;
+
+    emit "Parsing response";
+    $crg->parse_proc($rsp);
+    emit_prog "code=".$rsp->{ResponseCode};
+    $trn->cc($crg) if $rsp->{ResponseCode} == 0;    # add it to the transaction ***FIXME 000 vs 0
+    emit_done;
+
+    emit "Saving charge record";
+    $crg->save;
+    if ($crg->error) {
+        $trn->cancel;                               ### TODO:  refund any charges that went thru
+        my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+        exit emit_fail {-reason => "Error saving the charge record for HTX transaction #"
+                . $trn->trnid()
+                . ".  The charge error is : "
+                . $crg->error()
+                . "\nPlease contact support - your credit card MAY have been charged.  "
+                . "The charge ID is "
+                . ($crg->charge_id() || '--no id-')
+                . "\n$t0err"
+        };
+    }
+    emit_done;
+
+    # Credit card go thru?
+    if ($rsp->{ResponseCode} != 0) {    # ***FIXME 000 vs 0
+
+        # cancel the transaction
+        $trn->cancel;
+        my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+
+        # Nope, go back so the user can try again
+        my $perhaps = q{Something is wrong with the submitted information. };
+        $perhaps
+            = "Something is wrong with the submitted information. "
+            . "Perhaps you have mis-entered your credit/debit card number, "
+            . "expiration date, or card code?  "
+            if $rsp->{ResponseCode} == 823;   # ***FIXME new codes
+        $perhaps
+            = "It appears that you may have already purchased these tickets. "
+            . "(Check your email).  If you really do intend to repeat another of the same "
+            . "purchase, please wait a while to retry, or alter the purchase slightly so "
+            . "the amount charged is different... for example, a few more or less tickets.  "
+            . "This duplicate transaction check is a restriction imposed by your financial "
+            . "institution.  "
+            if $rsp->{ResponseCode} == 813;   # ***FIXME new codes
+        my $reason
+            = "Could Not Charge Your Card\n" 
+            . $perhaps
+            . "\nOur merchant processing gateway responded:\n"
+            . "  Code: "
+            . $rsp->{ResponseCode} . "\n"
+            . "  Description: "
+            . $rsp->{ResponseDescription} . "\n" . "\n"
+            . "Your card has NOT been charged, although an attempted charge may be "
+            . "recorded by your bank. $t0err";
+        exit emit_warn {-reason => $reason};
+    }
+
+    # Charge went thru OK, ...
+    emit_done {-reason => "Your card has been charged ".dol($crg->amount_charged()).", charge ID ". $crg->charge_id()};
+}
+
+# Commit the transaction
+emit "Comitting the transaction record";
+$trn->retally;
+$trn->phase_check;  # to make final
+$trn->complete;     # FIXME? phase_check above should do the complete, yes?
+if ($trn->error) {
+    my $t1err = $trn->error;
+    $trn->cancel;    ### TODO: auto refund on cancel.
+    my $t0err = $trn->error() || "Transaction $trn->{trnId} cancelled.";
+    exit emit_error {-reason => "Error comitting transaction #"
+            . $trn->trnid()
+            . ":\n $t1err"
+            . "\n$t0err"
+    };
+}
+emit_done;
+
+# Mark existing tickets as swapped
+emit "Marking old tickets as swapped";
+my @terr = ();
+foreach my $tix (@tixs) {
+    $tix->{tixState} = $TIX_STATE_SWAP;
+    $tix->save();
+    push @terr, "Ticket #" . $tix->tixno() . ": " . $tix->error()
+        if $tix->error();
+}
+exit emit_fail {reason => "Error(s) encountered updating ticket states:\n" . join ("/n", @terr)}
+    if @terr;
+emit_done;
+
+# Generate replacement tickets
+emit "Generating replacement tickets for old show";
+my $quantity = @tixs;
+for my $i (1 .. $quantity) {
+    my $tix = new htx::ticket(
+        -htx     => $htx,
+        -shoId   => $shonum,    ### Use old show
+        -tixPool => $opts->{webdb} ? $TIX_POOL_WEB : $TIX_POOL_BOOTH,
+    );
+    exit emit_fail {reason => "Error creating replacement ticket: " . $tix->error()}
+        if $tix->error;
+    # emit_text "($i/$quantity) Ticket " . $tix->tixno();  ###DO NOT SHOW THIS! 
+    ### This script's output is displayed as a progress indication during
+    ### a web-based exchange; we do not want to display replacement ticket numbers!
+}
+emit_done;
+
+# Issue new tickets & pickup code
+emit_text "New Pickup Code: " . $trn->fmtpickup();
+
+exit 0;
+
+# Initialize the database
+sub init_db {
+    my $htx   = shift;
+    my $opts  = $htx->{opts};
+    my $dbloc = $opts->{webdb} ? $htx->{cfg}->{dbweb} : $htx->{cfg}->{db};
+    emit "Connecting to database at $dbloc->{host}";
+    my $db = new htx::db;
+    $htx->{db} = $db;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->connect($dbloc);
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->setup;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    return emit_ok;
+}
+
+sub isotime {
+    my $time = shift;
+    my ($sec, $min, $hour, $mday, $mon, $year) = localtime($time);
+    return sprintf "%4.4d-%2.2d-%2.2d %2.2d:%2.2d:%2.2d",
+        1900 + $year, 1 + $mon, $mday,
+        $hour, $min, $sec;
+}
+
+# Record that a pickup was done
+sub record_pickup {
+    my $htx = shift;
+    my ($pikCode, $email, $result) = @_;
+    my $db = $htx->{db};
+    my $sql
+        = "INSERT INTO pickups SET "
+        . " pikCode="
+        . $db->quote($pikCode)
+        . ",pikEmail="
+        . $db->quote($email)
+        . ",pikRemoteAddr="
+        . $db->quote($ENV{REMOTE_ADDR} || "--n/a--")
+        . ",pikResult="
+        . $db->quote($result) . ";";
+    $db->insert($sql);
+    exit emit_fail {-reason => "Could not record pickup attempt: " . $db->error}
+        if $db->error;
+    return 1;
+}
+
+__END__
+
+=head1 NAME
+
+htx-swaptix - HaunTix Ticket Exchange Script
+
+=head1 SYNOPSIS
+
+ htx-swaptix [options]
+
+ Options:
+  -h    --help          Usage summary
+  -c    --config-file   Alternate config file
+  -k    --pickup-code   Specify tickets by pickup code - required or -n
+  -n    --tickets       Ticket numbers, comma list ok  - required or -k
+  -m    --email         Email address for transaction  - required
+  -s    --show          New show numer                 - required
+  -w    --webdb         Use database specified by web definitions
+  -v    --verbose       Verbose output; repeat for more verbosity
+  -f    --force         Force swap regardless of time restriction
+  -d    --deadline      Hours before deadline, default 24 hours
+  -y    --any           Swap any eligible; default all must be eligible
+  -z    --test          Try it but don't do it; test if swap is ok
+
+ Credit/Debit Card Options, if an up-charge is required
+  -a    --account-number       Card account number
+  -b    --ccv2 or --back-code  Code number on back of card
+  -e    --expires              Expiration date of card MMYY
+  -t    --track                Track data from card swiper
+  -u    --duplicate-check      Enable duplicate checking
+
+
+=head1 DESCRIPTION
+
+Exchanges the given tickets for the new show.
+
+=cut

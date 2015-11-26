@@ -1,0 +1,658 @@
+#!/usr/bin/perl -w
+#
+# Hauntix Database Synchronizer.
+#   Pushes and pulls data from web-based databases, to/from our booth-based master database.
+#
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Digest::MD5 qw(md5 md5_hex md5_base64);
+use Getopt::Long;
+use htx;
+use htx::charge;
+use htx::db;
+use htx::sale;
+use htx::show;
+use htx::ticket;
+use htx::transaction;
+use Pod::Usage;
+use Term::Emit qw/:all/;
+use Time::HiRes qw/gettimeofday tv_interval/;
+$| = 1;
+
+my $opts = {};
+GetOptions($opts, 
+    "config-file|c=s", 
+    "help|h", 
+    "stations|s=s",
+    "transaction|t=i", 
+    "verbose|v+") or pod2usage(2);
+pod2usage(1) if $opts->{help};
+Term::Emit::setopts(-maxdepth => $opts->{verbose} || 0,
+                    -showseverity => $Term::Emit::SEVLEV{'NOTE'});
+
+# Globals & config
+my $t0  = [gettimeofday];
+my $htx = {};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+
+my @web_stations = $opts->{stations}? split(/,\s*/, $opts->{stations}) : @TRN_STATIONS_WEB;
+
+# Do it
+connect_db($htx);
+sync_trn_w2b($htx);
+sync_trn_b2w($htx);
+sync_bogus_webtix($htx);
+sync_tixstate($htx);
+sync_balance($htx);
+sync_pickups($htx);
+
+# Done
+my $elapsed = tv_interval($t0, [gettimeofday]);
+emit_text {-adjust_level => -1}, "Elapsed time $elapsed seconds" if $opts->{verbose};
+exit 0;
+
+# Database setup
+sub connect_db {
+    my $htx = shift;
+    my $cfg = $htx->{cfg};
+    emit "Connecting to databases";
+
+    my $dbb = $htx->{dbb} = htx::db->new;    # dbb - booth database
+    my $dbw = $htx->{dbw} = htx::db->new;    # dbw - web database
+
+    emit "Master on $cfg->{db}->{host}";
+    $dbb->connect($cfg->{db});
+    exit emit_fail {-reason => "Unable to connect to database: " . $dbb->error}
+        if $dbb->error;
+    $dbb->setup;
+    exit emit_fail {-reason => "Unable to setup database: " . $dbb->error}
+        if $dbb->error;
+    emit_ok;
+
+    emit "Web on $cfg->{dbweb}->{host}";
+    $dbw->connect($cfg->{dbweb});
+    exit emit_fail {-reason => "Unable to connect to database: " . $dbw->error}
+        if $dbw->error;
+    $dbw->setup;
+    exit emit_fail {-reason => "Unable to setup database: " . $dbw->error}
+        if $dbw->error;
+    emit_ok;
+
+    emit_done;
+}
+
+sub sync_balance {
+    emit "Balancing ticket pools (mooching/pushing)";
+    my $htx = shift;
+    my $cfg = $htx->{cfg};
+    my $dbb = $htx->{dbb};
+    my $dbw = $htx->{dbw};
+
+### Rules:
+### 1) Only Idle tickets are eligible for balancing.
+### 2) Never have the same ticket in two different pools where it can be used at the same time.
+###   Thus, when moving a ticket from booth to web (when changing tixPool to 'w'),
+###     first change it on the booth db, then on the web db.
+###   Conversely, when moving a ticket from web to booth (when changing tixPool to 'b'),
+###     first change it on the web db, then on the booth db.
+### 3) When we move a ticket, we may also create it on the target side if it didn't exist.
+###   This is how the web gets its initial batch; tickets are usually created on the
+###   booth side all with tixPool=b, a chunk get "balanced" here so tixPool becomes 'w',
+###   then they're pushed to the web.  Thus the booth (master) d/b has both 'b' and 'w' tix,
+###   while a web d/b only holds its own 'w' tickets (why would it care about 'b's?).
+###   Later, if the booth mooches some tickets back from the web d/b,
+###     then the web d/b will see some 'b's.  That's how the booth tells the web d/b
+###     that it no longer "owns" those tickets.
+
+    # Determine remaining unsold amounts in each pool, on the booth (master) side
+    my $sql
+        = "SELECT shoId, "
+        . "       COUNT(IF(tixPool='b',1,NULL)) AS bcount,"
+        . "       COUNT(IF(tixPool='w',1,NULL)) AS wcount"
+        . "  FROM tickets"
+        . " WHERE tixState="
+        . $dbb->quote('Idle')
+        . " GROUP BY shoId";
+    my $recs = $dbb->select($sql);
+    exit emit_fail {-reason => "Unable to get count of free tickets in booth d/b: " . $dbb->error}
+        if $dbb->error;
+
+    # Show by show, do the balancing
+    my $goal  = $cfg->{sync}->{goal}  || 0.67;    # amount for booth; 0.0=none, 1.0=booth gets all
+    my $delta = $cfg->{sync}->{delta} || 4;       # granularity; amount of imbalance we'll leave
+    foreach my $rec (@$recs) {
+        my $shoId = $rec->{shoId};
+        emit "Balancing show #$shoId";
+
+        # Determine "imbalance" amount to be shifted
+        my $b     = $rec->{bcount};
+        my $w     = $rec->{wcount};
+        my $total = $b + $w;
+        my $bwant = int($total * $goal);
+        my $move  = $b - $bwant;                  # neg=move to booth, pos=move to web
+        emit_prog "($b, $w) m=$move";
+        if (abs($move) <= $delta) {
+
+            # not enuf to move, so skip it
+            emit_done "SKIP";
+            next;
+        }
+
+        # Get a list of tickets we're moving
+        $sql
+            = "SELECT tixId,shoId,tixCode,tixPool,tixState,tixNote FROM tickets "
+            . " WHERE tixState="
+            . $dbb->quote('Idle')
+            . "   AND shoId="
+            . $dbb->quote($shoId)
+            . "   AND tixPool="
+            . $dbb->quote($move < 0 ? q{w} : q{b})
+            . " ORDER BY tixId DESC"
+            . " LIMIT "
+            . abs($move);
+        my $mtix = $dbb->select($sql);
+        exit emit_fail {-reason => "Unable to get list of movers from booth d/b: " . $dbb->error}
+            if $dbb->error;
+        exit emit_fail {-reason => "Couldn't get the right number of tickets to move"}
+            if @$mtix != abs($move);
+
+        if ($move > 0) {
+
+            # Change pool ownership within the booth d/b
+            emit "Pushing $move from booth to web";
+            $sql = "UPDATE tickets SET tixPool='w' WHERE tixId IN ("
+                . join(',', map {$_->{tixId}} @$mtix) . ")";
+            $dbb->update($sql);
+            exit emit_error {-reason => "Error changing ticket pool in booth d/b: " . $dbb->error}
+                if $dbb->error;
+
+            # Insert or update the ticket in the web d/b
+###TODO: This is a slow operation; let's be smarter about it and only do the ones
+### we need to change.  Or, can we combine it in one big string?
+            foreach my $tix (@$mtix) {
+                my $tixId = $tix->{tixId};
+                emit "Moving ticket #$tixId to webdb";
+                $tix->{tixPool} = 'w';
+                $sql
+                    = "INSERT INTO tickets SET "
+                    . join(',', map {"$_=" . $dbw->quote($tix->{$_})} keys %$tix)
+                    . " ON DUPLICATE KEY UPDATE "
+                    . join(',',
+                    map {($_ eq 'tixId') ? () : "$_=" . $dbw->quote($tix->{$_})}
+                        keys %$tix);
+                $dbw->insert($sql);
+                exit emit_error {-reason => "Error moving ticket #$tixId to webdb: " . $dbw->error}
+                    if $dbw->error;
+            }
+        }
+        else {
+
+            # Change pool ownership within the web d/b, so they're not sold
+            # TODO: Should we just DELETE the tickets instead?  Might be cleaner...
+            emit "Pulling " . (-$move) . " from web to booth";
+            $sql = "UPDATE tickets SET tixPool='b' WHERE tixId IN ("
+                . join(',', map {$_->{tixId}} @$mtix) . ")";
+            $dbw->update($sql);
+            exit emit_error {-reason => "Error changing ticket pool in web d/b: " . $dbw->error}
+                if $dbw->error;
+
+            # Now change it in the booth d/b.  Since the booth is master,
+            # we don't have to worry about inserting new records.
+            $sql = "UPDATE tickets SET tixPool='b' WHERE tixId IN ("
+                . join(',', map {$_->{tixId}} @$mtix) . ")";
+            $dbb->update($sql);
+            exit emit_error {-reason => "Error changing ticket pool in booth d/b: " . $dbw->error}
+                if $dbw->error;
+        }
+        emit_note;
+    }
+
+}
+
+# Remove any bogus tickets from the web d/b
+#   The booth d/b is the master, if the web has any Idle tix not known to the booth,
+#   then we nuke  'em from the web d/b.
+sub sync_bogus_webtix {
+    emit "Nuking bogus webtix, if any";
+    my $htx = shift;
+    my $dbb = $htx->{dbb};
+    my $dbw = $htx->{dbw};
+    my $sql;
+    my $recs;
+
+    # Get a list  of all Idle tickets known to the booth
+    emit "Getting booth ticket list";
+    $sql = "SELECT tixId, tixCode FROM tickets WHERE tixState='Idle'";
+    my $btix = $dbb->select($sql);
+    exit emit_fail {-reason => "Unable to get ticket list from booth d/b: " . $dbb->error}
+        if $dbb->error;
+    emit_ok;
+
+    # Get the same list from the web d/b
+    emit "Getting webticket states";
+    my $wtix = $dbw->select($sql);
+    exit emit_fail {-reason => "Unable to get ticket list from web d/b: " . $dbw->error}
+        if $dbw->error;
+    emit_ok;
+
+    # index the booth tix for quick lookup
+    my %bidx = ();
+    foreach my $brec (@$btix) {
+        $bidx{$brec->{tixId}} = $brec;
+    }
+
+    # Look for webtix that shouldn't be there
+    emit "Scanning for bogus webtix";
+    my @nukelist = ();
+    foreach my $wrec (@$wtix) {
+        my $tixId = $wrec->{tixId};
+        my $brec  = $bidx{$tixId};
+        next if defined $brec    # known to booth,
+                && $brec->{tixCode} == $wrec->{tixCode};    #  and same code, then it's OK
+        emit_text "Bogus ticket #$tixId in web d/b"   if defined $brec;
+        emit_text "Unknown ticket #$tixId in web d/b" if !defined $brec;
+        push @nukelist, $tixId;
+    }
+    emit_prog scalar(@nukelist) . " found";
+    emit_done;
+
+    if (@nukelist) {
+        emit "Nuking the bogus tickets";
+        $sql = "DELETE FROM tickets WHERE tixId IN ("
+            . join(',', map {$dbb->quote($_)} @nukelist) . ")";
+        $dbw->delete($sql);
+        exit emit_fail {-reason => "Unable to remove bogus tickets from booth d/b: " . $dbw->error}
+            if $dbw->error;
+        emit_prog scalar(@nukelist) . " removed";
+        emit_done;
+    }
+
+    emit_done;
+}
+
+# Collect pickup records.  This is always web to booth.
+sub sync_pickups {
+    emit "Synchronizing pickup records";
+    my $htx = shift;
+    my $dbb = $htx->{dbb};
+    my $dbw = $htx->{dbw};
+    my $sql;
+    my $recs;
+
+    # Find latest pickup record already known to the booth - simple way
+    $sql  = "SELECT max(pikId) AS last_id FROM pickups";
+    $recs = $dbb->select($sql);
+    exit emit_fail {-reason => "Unable to select last pickup time from booth d/b: " . $dbb->error}
+        if $dbb->error;
+    exit emit_fail {-reason => "Expected one result from max() scan"}
+        if @$recs != 1;
+    my $last_id = $recs->[0]->{last_id} || 0;
+
+    # Get all new pickup records
+    $sql = "SELECT * FROM pickups" . " WHERE pikId > " . $dbw->quote($last_id);
+    my $pikrecs = $dbw->select($sql);
+    exit emit_fail {-reason => "Unable to select pickups from web d/b: " . $dbw->error}
+        if $dbw->error;
+    emit_text "Found " . scalar(@$pikrecs) . " new web pickups";
+
+    # Insert them into the booth d/b
+    foreach my $pik (@$pikrecs) {
+        emit "Pickup #" . $pik->{pikId};
+
+        $sql = "INSERT INTO pickups SET "
+            . join(',', map {"$_=" . $dbb->quote($pik->{$_})} keys %$pik);
+        $dbb->insert($sql);
+        exit emit_error {-reason => "Error inserting booth pickup: " . $dbb->error}
+            if $dbb->error;
+    }
+}
+
+# Synchronize transactions web to booth (with sales, charges, and ticket state updates)
+sub sync_trn_w2b {
+    emit "Synchronizing transactions web to booth";
+    my $htx = shift;
+    my $dbb = $htx->{dbb};
+    my $dbw = $htx->{dbw};
+    my $sql;
+    my $recs;
+
+    # Find last web transaction already known to the booth - simple way
+    my $last_trnid = $opts->{transaction};
+    if (!$last_trnid) {
+        $sql
+            = "SELECT max(trnId) AS max_trnId "
+            . " FROM transactions"
+            . " WHERE trnStation IN ("
+            . join(',', map {$dbw->quote($_)} @web_stations) . ")";
+        $recs = $dbb->select($sql);
+        exit emit_fail {-reason => "Unable to select transactions from booth d/b: " . $dbb->error}
+            if $dbb->error;
+        exit emit_fail {-reason => "Expected one result from max() scan"}
+            if @$recs != 1;
+        $last_trnid = $recs->[0]->{max_trnId} || 0;
+    }
+    emit_text "Starting after web transaction $last_trnid";
+
+    # Get all new, final web transactions
+    $sql
+        = "SELECT * FROM transactions"
+        . " WHERE trnId > "
+        . $dbw->quote($last_trnid)
+        . "   AND trnPhase IN ("
+        . $dbw->quote($TRN_PHASE_FIN) . q{,}
+        . $dbw->quote($TRN_PHASE_XCL) . q{)}
+        . "   AND trnStation IN ("
+        . join(',', map {$dbw->quote($_)} @web_stations) . ")";
+    my $trnrecs = $dbw->select($sql);
+    exit emit_fail {-reason => "Unable to select transactions from web d/b: " . $dbw->error}
+        if $dbw->error;
+    emit_text "Found " . scalar(@$trnrecs) . " new web transactions";
+
+    foreach my $trn (@$trnrecs) {
+        my $trnId = $trn->{trnId};
+        emit "Trn #$trnId ($trn->{trnPhase})";
+
+        # From WebDB: Charges
+        $htx->{db} = $htx->{dbw};
+        $sql = "SELECT * FROM charges WHERE trnId=" . $dbw->quote($trnId);
+        my $chgrecs = $dbw->select($sql);
+        exit emit_error {-reason => "Failed to load web charges: " . $dbw->error} if $dbw->error;
+        emit_prog @$chgrecs . " chg, ";
+
+        # From WebDB: Sales
+        $htx->{db} = $htx->{dbw};
+        $sql = "SELECT * FROM sales WHERE trnId=" . $dbw->quote($trnId);
+        my $salrecs = $dbw->select($sql);
+        exit emit_error {-reason => "Failed to load web sales: " . $dbw->error} if $dbw->error;
+        emit_prog @$salrecs . " sal, ";
+
+        # From WebDB: Tickets for each sale
+        $htx->{db} = $htx->{dbw};
+        $sql = "SELECT * FROM tickets WHERE salId IN ("
+            . join(',', map {$dbw->quote($_->{salId})} @$salrecs) . ")";
+        my $tixrecs = @$salrecs ? $dbw->select($sql) : [];
+        exit emit_error {-reason => "Failed to load web tickets: " . $dbw->error . "\n$sql"}
+            if $dbw->error;
+        emit_prog @$tixrecs . " tix";
+
+        # To BoothDB: Create the new transaction with its charges, sales, and tickets
+        $htx->{db} = $htx->{dbb};
+        $dbb->do_sql("START TRANSACTION");
+        exit emit_error {-reason => "Cannot start booth d/b transaction: " . $dbb->error}
+            if $dbb->error;
+
+        foreach my $chg (@$chgrecs) {
+            $sql = "INSERT INTO charges SET "
+                . join(',', map {"$_=" . $dbb->quote($chg->{$_})} keys %$chg);
+            $dbb->insert($sql);
+            exit emit_error {-reason => "Error inserting booth charge: " . $dbb->error}
+                if $dbb->error;
+        }
+        foreach my $sal (@$salrecs) {
+            $sql = "INSERT INTO sales SET "
+                . join(',', map {"$_=" . $dbb->quote($sal->{$_})} keys %$sal);
+            $dbb->insert($sql);
+            exit emit_error {-reason => "Error inserting booth sale: " . $dbb->error}
+                if $dbb->error;
+        }
+        foreach my $tix (@$tixrecs) {
+            exit emit_fail {-reason => "*** Non-web pool ticket! $tix->{tixId}"}
+                if $tix->{tixPool} ne $TIX_POOL_WEB;
+            $sql
+                = "INSERT INTO tickets SET "
+                . join(',', map {"$_=" . $dbb->quote($tix->{$_})} keys %$tix)
+                . " ON DUPLICATE KEY UPDATE "
+                . join(',',
+                map {($_ eq 'tixId' || $_ !~ m/^tix/) ? () : "$_=" . $dbb->quote($tix->{$_})}
+                    keys %$tix)
+                . ",salId="
+                . $dbb->quote($tix->{salId});
+            $dbb->insert($sql);
+            exit emit_error {-reason => "Error inserting or updating ticket: " . $dbb->error}
+                if $dbb->error;
+        }
+        $sql = "INSERT INTO transactions SET "
+            . join(',', map {"$_=" . $dbb->quote($trn->{$_})} keys %$trn);
+        $dbb->insert($sql);
+        exit emit_error {-reason => "Error inserting transaction: " . $dbb->error} if $dbb->error;
+
+        $dbb->do_sql("COMMIT");
+        exit emit_error {-reason => "Cannot commit transaction: " . $dbb->error} if $dbb->error;
+
+        emit_ok;
+    }
+
+    emit_done;
+}
+
+# Synchronize transactions booth to web (with sales, charges, and ticket state updates)
+sub sync_trn_b2w {
+    emit "Synchronizing transactions booth to web";
+    my $htx = shift;
+    my $dbb = $htx->{dbb};
+    my $dbw = $htx->{dbw};
+    my $sql;
+    my $recs;
+
+    # Find last booth transaction already known to the web - simple way
+    $sql
+        = "SELECT max(trnId) AS max_trnId"
+        . "  FROM transactions"
+        . " WHERE trnStation NOT IN ('W','X','Y','Z')";
+    $recs = $dbw->select($sql);
+    exit emit_fail {-reason => "Unable to select transactions from web d/b: " . $dbw->error}
+        if $dbw->error;
+    exit emit_fail {-reason => "Expected one result from max() scan"}
+        if @$recs != 1;
+    my $last_trnid = $recs->[0]->{max_trnId} || 0;
+
+    # Get all new, final booth transactions
+    $sql
+        = "SELECT * FROM transactions"
+        . " WHERE trnId > "
+        . $dbb->quote($last_trnid)
+        . "   AND trnPhase = "
+        . $dbb->quote($TRN_PHASE_FIN)
+        . "   AND trnStation NOT IN ("
+        . join(',', map {$dbb->quote($_)} @web_stations) . ")";
+    my $trnrecs = $dbb->select($sql);
+    exit emit_fail {-reason => "Unable to select transactions from booth d/b: " . $dbb->error}
+        if $dbw->error;
+    emit_text "Found " . scalar(@$trnrecs) . " new booth transactions";
+
+    foreach my $trn (@$trnrecs) {
+        my $trnId = $trn->{trnId};
+        emit "Trn #$trnId";
+
+        # From BoothDB: Charges
+        $htx->{db} = $htx->{dbb};
+        $sql = "SELECT * FROM charges WHERE trnId=" . $dbb->quote($trnId);
+        my $chgrecs = $dbb->select($sql);
+        exit emit_error {-reason => "Failed to load booth charges: " . $dbb->error} if $dbb->error;
+        emit_prog @$chgrecs . " chg, ";
+
+        # From BoothDB: Sales
+        $htx->{db} = $htx->{dbb};
+        $sql = "SELECT * FROM sales WHERE trnId=" . $dbb->quote($trnId);
+        my $salrecs = $dbb->select($sql);
+        exit emit_error {-reason => "Failed to load booth sales: " . $dbb->error} if $dbb->error;
+        emit_prog @$salrecs . " sal, ";
+
+        # From BoothDB: Tickets for each sale
+        $htx->{db} = $htx->{dbb};
+        $sql = "SELECT * FROM tickets WHERE salId IN ("
+            . join(',', map {$dbb->quote($_->{salId})} @$salrecs) . ")";
+        my $tixrecs = @$salrecs ? $dbb->select($sql) : [];
+        exit emit_error {-reason => "Failed to load booth tickets: " . $dbb->error . "\n$sql"}
+            if $dbb->error;
+        emit_prog @$tixrecs . " tix";
+
+        # To WebDB: Create the new transaction with its charges, sales, and tickets
+        $htx->{db} = $htx->{dbw};
+        $dbb->do_sql("START TRANSACTION");
+        exit emit_error {-reason => "Cannot start web d/b transaction: " . $dbw->error}
+            if $dbw->error;
+
+        foreach my $chg (@$chgrecs) {
+            $sql = "INSERT INTO charges SET "
+                . join(',', map {"$_=" . $dbw->quote($chg->{$_})} keys %$chg);
+            $dbw->insert($sql);
+            exit emit_error {-reason => "Error inserting web charge: " . $dbw->error}
+                if $dbw->error;
+        }
+        foreach my $sal (@$salrecs) {
+            $sql = "INSERT INTO sales SET "
+                . join(',', map {"$_=" . $dbw->quote($sal->{$_})} keys %$sal);
+            $dbw->insert($sql);
+            exit emit_error {-reason => "Error inserting web sale: " . $dbw->error} if $dbw->error;
+        }
+        foreach my $tix (@$tixrecs) {
+            exit emit_fail {-reason => "*** Web pool ticket, should be booth ticket! $tix->{tixId}"}
+                if $tix->{tixPool} eq $TIX_POOL_WEB;
+            $sql
+                = "INSERT INTO tickets SET "
+                . join(',', map {"$_=" . $dbw->quote($tix->{$_})} keys %$tix)
+                . " ON DUPLICATE KEY UPDATE "
+                . join(',',
+                map {($_ eq 'tixId' || $_ !~ m/^tix/) ? () : "$_=" . $dbw->quote($tix->{$_})}
+                    keys %$tix)
+                . ",salId="
+                . $dbw->quote($tix->{salId});
+            $dbw->insert($sql);
+            exit emit_error {-reason => "Error inserting or updating ticket: " . $dbw->error}
+                if $dbw->error;
+        }
+        $sql = "INSERT INTO transactions SET "
+            . join(',', map {"$_=" . $dbw->quote($trn->{$_})} keys %$trn);
+        $dbw->insert($sql);
+        exit emit_error {-reason => "Error inserting transaction: " . $dbw->error} if $dbw->error;
+
+        $dbw->do_sql("COMMIT");
+        exit emit_error {-reason => "Cannot commit transaction: " . $dbw->error} if $dbw->error;
+
+        emit_ok;
+    }
+
+    emit_done;
+}
+
+# Synchronize ticket states; for if a ticket gets used, swapped, voided etc
+#   Higher-ranked state wins
+sub sync_tixstate {
+    emit "Synchronizing ticket states between booth and web";
+    my $htx = shift;
+    my $dbb = $htx->{dbb};
+    my $dbw = $htx->{dbw};
+    my $sql;
+    my $recs;
+
+    # Get the state of all booth tickets
+    emit "Getting booth ticket states";
+    $sql = "SELECT tixId, tixState, tixPool FROM tickets";
+    my $btix = $dbb->select($sql);
+    exit emit_fail {-reason => "Unable to select ticket states from booth d/b: " . $dbb->error}
+        if $dbb->error;
+    emit_ok;
+
+    # Get the state of all web tickets
+    emit "Getting webticket states";
+    $sql = "SELECT tixId, tixState, tixPool FROM tickets";
+    my $wtix = $dbw->select($sql);
+    exit emit_fail {-reason => "Unable to select ticket states from web d/b: " . $dbw->error}
+        if $dbw->error;
+    emit_ok;
+
+    # index the booth tix for quick lookup
+    my %bidx = ();
+    foreach my $brec (@$btix) {
+        $bidx{$brec->{tixId}} = $brec;
+    }
+
+###TODO*** What about web transaction in progress (tixState=HELD), will this release it???? would be bad.
+
+###TODO*** SWAP state could originate on web or booth
+
+#  our $TIX_STATE_IDLE = 'Idle';    # new, unused, available ticket
+#  our $TIX_STATE_HELD = 'Held';    # temporarily reserved
+#  our $TIX_STATE_SOLD = 'Sold';    # sold to a purchaser
+#  our $TIX_STATE_USED = 'Used';    # used/expired
+#  our $TIX_STATE_VOID = 'Void';    # voided/cancelled
+#  our $TIX_STATE_SWAP = 'Swap';    # ticket was swapped for another show or type
+
+
+    # Look for differences to push
+    foreach my $wrec (@$wtix) {
+        my $tixId = $wrec->{tixId};
+        my $brec  = $bidx{$tixId};
+        next if !defined $brec;    # ignore it if the booth doesn't know about it
+        next if $wrec->{tixState} eq $brec->{tixState};
+        my $rank_b = $TIX_RANK_STATE{ucfirst $brec->{tixState}};
+        my $rank_w = $TIX_RANK_STATE{ucfirst $wrec->{tixState}};
+        if (!$rank_b) {
+            emit_text "*** Yikes! No rank for booth ticket $tixId state $brec->{tixState}.  Skipping...";
+            next;
+        }
+        if (!$rank_w) {
+            emit_text "*** Yikes! No rank for web ticket $tixId state $wrec->{tixState}.  Skipping...";
+            next;
+        }
+        emit_text "Ticket #$tixId Pool mismatch!" if $wrec->{tixPool} ne $brec->{tixPool};
+        if ($rank_w > $rank_b) {
+            # Pull web to booth
+            emit_text "Pull ticket #$tixId state w=$wrec->{tixState} -> b=$brec->{tixState}";    ### TEMP
+            $sql
+                = "UPDATE tickets"
+                . "   SET tixState="
+                . $dbb->quote($wrec->{tixState})
+                . " WHERE tixId="
+                . $dbb->quote($wrec->{tixId});
+            $dbb->update($sql);
+            exit emit_error {-reason => "Error updating booth ticket #$tixId state: " . $dbb->error}
+                if $dbb->error;
+        }
+        else {
+            # Push booth to web
+            emit_text "Push ticket #$tixId state b=$brec->{tixState} -> w=$wrec->{tixState}";    ### TEMP
+            $sql
+                = "UPDATE tickets"
+                . "   SET tixState="
+                . $dbw->quote($brec->{tixState})
+                . " WHERE tixId="
+                . $dbw->quote($brec->{tixId});
+            $dbw->update($sql);
+            exit emit_error {-reason => "Error updating web ticket #$tixId state: " . $dbw->error}
+                if $dbw->error;
+        }
+    }
+
+    emit_done;
+}
+
+__END__
+
+=head1 NAME
+
+htx-sync - HaunTix Database Synchronizer
+
+=head1 SYNOPSIS
+
+ htx-sync [options]
+
+ Options:
+  -h    --help          Usage summary
+  -c    --config-file   Alternate config file
+  -s    --station       Sync only these web stations
+  -t    --transaction   Resync start from thsi transaction number
+  -v    --verbose       Verbose output
+
+=head1 DESCRIPTION
+
+Utility that connects with off-site web databases and synchronizes
+data from there with the master database.  This is how sales done on the
+web are known in the ticket booth.  This script is run every so often --
+every 13 minutes for example -- to discover what has been sold online.
+
+=cut
+

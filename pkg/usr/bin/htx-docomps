@@ -1,0 +1,84 @@
+#!/usr/bin/perl -w
+#
+# Temporary wrapper for htx-mkcomp, until we add emailing and lists to htx-mkcomp
+#  This script generates comps and sends email with the pickup code to the list of
+# email addresses given - it's all HARDCODED!
+
+use strict;
+use warnings;
+use lib '../lib';
+use MIME::Lite;
+
+my $TEST_MODE = 0;
+
+die "*** Supply awards list file containing '#tix shoId email' lines\n" if !$ARGV[0];
+open(F,$ARGV[0]) or die "*** Could not open file $ARGV[0]: $!\n";
+
+foreach my $line (<F>) {
+    next unless $line =~ m/^(\d+)\s+(\d+)\s*(\S+)/;
+    my ($qty, $shonum, $to) = ($1, $2, $3);
+    $qty ||= 0;
+    next unless $qty > 0;
+
+#    my $cmd = qq{perl -I pkg/usr/share/perl5 pkg/usr/bin/htx-mkcomp -n $qty -s $shonum};
+    my $cmd = qq{htx-mkcomp -n $qty -s $shonum};
+    $cmd .= qq{ -w} if !$TEST_MODE;
+    $cmd .= qq{ -t 'Thanx for your help!'};
+    $cmd .= qq{ -T "Full Comp Code:Staff Org:'hm' Who:'$to' Authby:'Dirs' Reason:'40hrs'"};
+    my $out = qx($cmd 2>&1);
+    die "*** Unable to generate pickup code:\n$out\n"
+        unless $out =~ m/Pickup Code (\S+)/;
+    my $pikCode = $1 || "00000-0000";
+
+    my $sent_ok = 0;
+    for (1..3) {
+        my $msg = MIME::Lite->new(
+            From    => q{Tickets@HauntedMines.org},
+            To      => $to,
+            Subject => "Haunted Mines Tickets Award - Thanx for your help!",
+            Type    => "multipart/mixed"
+        );
+        $msg->attach(
+            Type => "TEXT",
+            Data => qq{
+Thank you for volunteering at the Haunted Mines!
+Here are tickets you've earned by helping us as a head actor.
+Note that you may receive multiple emails; check the pickup codes in 
+each, they may be different, in which case you have even more tickets.
+Stay Scary!
+                          ---- o ----
+
+To view and print your tickets, 
+   * Go to the Haunted Mines website at http://HauntedMines.org 
+   * Click "Buy Tickets Now"
+   * Click "Enter Pickup Code"  
+   * Enter your Pickup Code and email address.
+Your tickets will be emailed to you as a PDF file.  You may also view and 
+print the tickets right then.
+
+                    Your Pickup Code is $pikCode
+
+Keep this pickup code in a safe place; whoever has it can use these tickets.
+Thanx for visiting the Haunted Mines - we look forward to scaring you!
+
+}
+        );
+        my $ok = $TEST_MODE || $msg->send(
+            "smtp", "smtpout.secureserver.net",
+            AuthUser => q{steve@hauntedmines.org},
+            AuthPass => q{Fire4700}
+        );
+        if (!$ok) {
+            print "  ...mail error, retrying send to $to\n";
+            sleep 3;
+            next;
+        }
+        $sent_ok = 1;
+        print "  Fake:" if $TEST_MODE;
+        print "  Sent $pikCode for $qty tickets to show $shonum sent to $to\n";
+        last;
+    }
+    if (!$sent_ok) {
+        print "  *** Could not send $pikCode for $qty tickets to show $shonum sent to $to\n";
+    }
+}

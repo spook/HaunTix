@@ -1,0 +1,116 @@
+#!/usr/bin/perl -w
+#
+# Command-line interface to generate and load tickets
+#
+use strict;
+use warnings;
+use lib '../lib';
+use Config::Std;
+use Getopt::Long;
+use Pod::Usage;
+use Term::Emit qw/:all/;
+use Time::HiRes qw/gettimeofday tv_interval/;
+use htx;
+use htx::show;
+use htx::ticket;
+
+my $opts = {};
+GetOptions($opts, 
+            "help|h",
+            "config-file|c=s",
+            "quantity|n=s",
+            "pool|p=s",
+            "showid|s=s",
+            "verbose|v",
+            "webdb|w",)
+    or pod2usage(2);
+pod2usage(1) if $opts->{help};
+my $quantity = int($opts->{quantity} || 0);
+die "*** Positive integer --quantity required\n" if $quantity <= 0;
+my $pool = $opts->{pool} || $TIX_POOL_BOOTH;
+die "*** --pool must be '$TIX_POOL_BOOTH' or '$TIX_POOL_WEB'\n"
+    if ($pool ne $TIX_POOL_BOOTH) && ($pool ne $TIX_POOL_WEB);
+my $shoId = int($opts->{showid} || 0);
+die "*** Valid --showid required\n" if $shoId <= 0;
+
+# Good random seed
+srand(time ^ $$ ^ unpack "%L*", `ps axww | gzip -f`);
+
+# Globals & config
+emit "Loading configuration" if $opts->{verbose};
+my $htx = {opts => $opts};
+read_config $opts->{'config-file'} || $CONFIG_FILE => $htx->{cfg};
+emit_ok if $opts->{verbose};
+
+# Database setup
+init_db($htx);
+
+# Does this show exist?
+emit "Checking show $shoId" if $opts->{verbose};
+my $show = htx::show->load(-htx => $htx, -shoId => $shoId);
+exit emit_fail {reason => "Show # $shoId does not exist or can't load: " . $show->error}
+    if $show->error;
+emit_ok if $opts->{verbose};
+
+# Generate new tickets
+emit "Generating tickets" if $opts->{verbose};
+
+my $t0 = [gettimeofday];
+for my $i (1 .. $quantity) {
+    my $tix = new htx::ticket(
+        -htx     => $htx,
+        -shoId   => $shoId,
+        -tixPool => $pool
+    );
+    exit emit_fail {reason => "Error creating ticket: " . $tix->error()}
+        if $tix->error;
+    emit_text "($i/$quantity) Ticket ".$tix->tixno() if $opts->{verbose};
+}
+my $elapsed = tv_interval($t0, [gettimeofday]);
+emit_done {reason => "Elapsed time $elapsed seconds"} if $opts->{verbose};
+
+exit 0;
+
+# Initialize the database
+sub init_db {
+    my $htx   = shift;
+    my $opts  = $htx->{opts};
+    my $dbloc = $opts->{webdb} ? $htx->{cfg}->{dbweb} : $htx->{cfg}->{db};
+    emit "Connecting to database at $dbloc->{host}" if $opts->{verbose};
+    my $db = new htx::db;
+    $htx->{db} = $db;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->connect($dbloc);
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    $db->setup;
+    exit emit_error {-reason => $db->error} if $db->error;
+
+    return emit_ok;
+}
+
+__END__
+
+=head1 NAME
+
+htx-mktix - HaunTix Ticket generator
+
+=head1 SYNOPSIS
+
+ htx-mktix [options]
+
+ Options:
+  -h    --help          Usage summary
+  -c    --config-file   Alternate config file
+  -n    --quantity      Number of tickets to generate - required
+  -p    --pool          Ticket pool: b for booth, or w for web. Defaults to 'b'
+  -s    --showid        Show numer (shoId in database) - required
+  -w    --webdb         Use database specified by web definitions
+  -v    --verbose       Verbose output
+
+=head1 DESCRIPTION
+
+Generates new idle tickets and loads them into the database.
+
+=cut

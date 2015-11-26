@@ -1,0 +1,2 @@
+?package(hauntix):needs="X11|text|vc|wm" section="Applications/Office"\
+  title="Hauntix POS" command="/usr/bin/hauntix-pos"
